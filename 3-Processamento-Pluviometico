@@ -1,0 +1,872 @@
+# ================================================================
+# CAMPOS DOS GOYTACAZES – PROCESSAMENTO A PARTIR DE PLANILHAS + ETA_BESM (CSV)
+# Janelas: Historico 1994–2024 | Cenários (RCPs) 2006–2064
+# ================================================================
+
+# -------------------- JANELAS DE ANOS -----------------------------
+YEAR_MIN      <- 1994
+YEAR_MAX_HIST <- 2024   # Limite para séries históricas (ERA5/Estação)
+YEAR_MAX_FUT  <- 2064   # Limite superior para cenários
+SCEN_MIN      <- 2006   # Cenários (RCPs) a partir de 2006
+
+suppressPackageStartupMessages({
+  libs <- c("readr","readxl","dplyr","tidyr","stringr","stringi","lubridate",
+            "ggplot2","purrr","zoo","Kendall","trend","tibble")
+  for (pkg in libs) if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg); library(pkg, character.only = TRUE)
+  }
+  if (!require(plotrix, quietly = TRUE)) {
+    try(suppressWarnings(install.packages("plotrix")), silent = TRUE)
+  }
+  if (!require(writexl, quietly = TRUE)) {
+    try(suppressWarnings(install.packages("writexl")), silent = TRUE)
+    library(writexl)
+  }
+})
+
+# -------------------- LOG / PASTAS -------------------------------
+log_info <- function(msg) cat(sprintf("🟢 %s\n", msg))
+log_warn <- function(msg) cat(sprintf("🟡 %s\n", msg))
+
+project_root <- "C:/Users/alexs/OneDrive/Área de Trabalho/clima_campos"
+dados_dir    <- file.path(project_root, "dados")            # ERA5/Estação CSV/XLSX
+eta_dir      <- file.path(project_root, "Eta_BESM_20km")    # CSVs diários *_daily_campos.csv
+
+stamp     <- format(Sys.time(), "%Y-%m-%d_%Hh%M")
+OUT_DIR   <- file.path(project_root, "resultados", stamp)
+DADOS_DIR <- file.path(project_root, "dados",      stamp)
+dir.create(OUT_DIR,   recursive = TRUE, showWarnings = FALSE)
+dir.create(DADOS_DIR, recursive = TRUE, showWarnings = FALSE)
+log_info(paste("Saídas gráficas em:", OUT_DIR))
+log_info(paste("Arquivos de dados em:", DADOS_DIR))
+
+# -------------------- HELPERS GERAIS -----------------------------
+.normalize_names <- function(nms){
+  if (is.null(nms)) return(character(0))
+  nms |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    tolower() |>
+    stringr::str_replace_all("[^a-z0-9]+","_") |>
+    stringr::str_replace_all("^_|_$","")
+}
+.pick_col <- function(df, patterns, required = TRUE, hint = "coluna"){
+  nm <- names(df); hit <- NA_character_
+  for (p in patterns){
+    idx <- stringr::str_which(nm, regex(p, ignore_case = TRUE))
+    if (length(idx) >= 1) { hit <- nm[idx[1]]; break }
+  }
+  if (isTRUE(required) && is.na(hit)) {
+    stop(sprintf("🚩 Não encontrei %s. Procurei: %s.\nColunas: %s",
+                 hint, paste(patterns, collapse = " | "), paste(names(df), collapse = ", ")),
+         call. = FALSE)
+  }
+  hit
+}
+.read_csv_smart <- function(path){
+  sup <- suppressWarnings
+  x <- sup(try(readr::read_delim(path, delim = ";",
+                                 locale = readr::locale(decimal_mark = ","),
+                                 show_col_types = FALSE), silent = TRUE))
+  if (!inherits(x, "try-error") && ncol(x) > 1) return(x)
+  x <- sup(try(readr::read_delim(path, delim = ",",
+                                 locale = readr::locale(decimal_mark = "."),
+                                 show_col_types = FALSE), silent = TRUE))
+  if (inherits(x, "try-error")) stop("🚩 Falha ao ler CSV (delim/decimal).", call. = FALSE)
+  x
+}
+.limit_anos <- function(df, col = "ano", min_year = YEAR_MIN, max_year = YEAR_MAX_HIST){
+  if (is.null(df) || !nrow(df) || is.na(col) || !(col %in% names(df))) return(df)
+  dplyr::filter(df, .data[[col]] >= min_year, .data[[col]] <= max_year)
+}
+
+# --- NOVO: normalizador de rótulos de cenário ---
+.normalize_cenario <- function(x){
+  x <- tolower(trimws(x))
+  x <- dplyr::case_when(
+    stringr::str_detect(x, "hist")           ~ "Historico",   # sem acento, conforme pedido
+    stringr::str_detect(x, "rcp\\s*4\\.?5")  ~ "RCP 4.5",
+    stringr::str_detect(x, "rcp\\s*8\\.?5")  ~ "RCP 8.5",
+    TRUE ~ x
+  )
+  x
+}
+
+# --- NOVO: correção automática de unidade (mm vs mm*1000) ---
+.fix_unidade_anual <- function(df, col="precipitacao", fonte="(desconhecida)"){
+  if (is.null(df) || !nrow(df) || !(col %in% names(df))) return(df)
+  v <- suppressWarnings(as.numeric(df[[col]]))
+  if (!length(v) || all(!is.finite(v))) return(df)
+  med <- stats::median(v, na.rm = TRUE)
+  if (is.finite(med) && med > 10000) {
+    message(sprintf("✅ %s ÷ 1000 (mediana anual=%.1f) – correção de unidade aplicada.", fonte, med))
+    df[[col]] <- v/1000
+  }
+  df
+}
+
+# -------------------- LEITURA ERA5 (CSV/XLSX) --------------------
+arquivo_era5 <- {
+  pref <- file.path(dados_dir, "exportacao_era5_com_precip_e_radiacao.xlsx")
+  if (file.exists(pref)) pref else {
+    cand <- list.files(dados_dir, pattern = "era5|exportacao_era5", full.names = TRUE, ignore.case = TRUE)
+    if (length(cand)) cand[1] else NA_character_
+  }
+}
+if (!is.na(arquivo_era5)) log_info(paste("ERA5 detectado em:", arquivo_era5))
+
+era5_anual  <- NULL
+era5_diario <- NULL
+tem_era5_precip <- FALSE
+
+detectar_col_prec_diaria_era5 <- function(df_norm){
+  .pick_col(
+    df_norm,
+    c("^precipitacao_dia_mm$","^precipitacao_mm$","^p_mm$","^precip_mm$","^precipitacao_dia$","^precip$",
+      "^tp$","^total_?precip(itation)?$","^rr$","^pr(_?mm)?$"),
+    required = FALSE, hint="precipitação diária em mm (ERA5)"
+  )
+}
+
+if (!is.na(arquivo_era5)) {
+  if (grepl("\\.csv$", arquivo_era5, ignore.case = TRUE)) {
+    log_info("Lendo ERA5 (CSV)…")
+    dfa <- .read_csv_smart(arquivo_era5)
+    names(dfa) <- .normalize_names(names(dfa))
+    col_ano  <- suppressWarnings(.pick_col(dfa, c("^ano$","^year$","^yyyy$","^ano_ref$"), required = FALSE))
+    col_prec <- suppressWarnings(.pick_col(dfa, c("^precipitacao(_?total)?(_?mm)?$","^precip(_?total)?(_?mm)?$",
+                                                  "^total_?precip","^pr(_?(mm|total))?$","^chuva(_?total)?$","^anual(_?mm)?$"),
+                                           required = FALSE))
+    if (!is.na(col_ano) && !is.na(col_prec)) {
+      tem_era5_precip <- TRUE
+      era5_anual <- dfa |>
+        dplyr::transmute(ano = suppressWarnings(as.integer(.data[[col_ano]])),
+                         precipitacao = suppressWarnings(as.numeric(.data[[col_prec]]))) |>
+        dplyr::filter(is.finite(ano), is.finite(precipitacao)) |>
+        dplyr::arrange(ano)
+    } else {
+      col_data <- suppressWarnings(.pick_col(dfa, c("^data$","^date$"), required = FALSE))
+      col_pmm  <- detectar_col_prec_diaria_era5(dfa)
+      if (!is.na(col_data) && !is.na(col_pmm)) {
+        tem_era5_precip <- TRUE
+        era5_diario <- dfa |>
+          dplyr::transmute(data = as.Date(.data[[col_data]]),
+                           ano  = lubridate::year(data),
+                           mes  = lubridate::month(data),
+                           precipitacao_dia = suppressWarnings(as.numeric(.data[[col_pmm]]))) |>
+          dplyr::filter(!is.na(data))
+        era5_anual <- era5_diario |>
+          dplyr::group_by(ano) |>
+          dplyr::summarise(precipitacao = sum(precipitacao_dia, na.rm = TRUE), .groups="drop")
+      } else {
+        log_warn("ERA5 (CSV) encontrado, mas sem coluna de precip detectável.")
+      }
+    }
+  } else {
+    log_info("Lendo ERA5 (XLSX)…")
+    sh <- readxl::excel_sheets(arquivo_era5)
+    nome_anual  <- if ("ERA5_ANUAL"  %in% sh) "ERA5_ANUAL"  else if (length(sh) >= 2) sh[2] else NA_character_
+    dfa <- if (!is.na(nome_anual)) try(readxl::read_excel(arquivo_era5, sheet = nome_anual), silent = TRUE) else structure(list(), class = "try-error")
+    if (!inherits(dfa,"try-error") && nrow(dfa)) {
+      names(dfa) <- .normalize_names(names(dfa))
+      ok <- TRUE
+      col_ano  <- try(.pick_col(dfa, c("^ano$","^year$","^yyyy$","^ano_ref$"), TRUE),  silent = TRUE)
+      col_prec <- try(.pick_col(dfa, c("^precipitacao(_?total)?(_?mm)?$","^precip(_?total)?(_?mm)?$",
+                                       "^total_?precip","^pr(_?(mm|total))?$","^chuva(_?total)?$","^anual(_?mm)?$"),
+                                TRUE), silent = TRUE)
+      if (inherits(col_ano,"try-error") || inherits(col_prec,"try-error")) { ok <- FALSE; log_warn("Planilha anual ERA5 sem 'ano'/'precip'. Tentando diário.") }
+      if (ok) {
+        tem_era5_precip <- TRUE
+        era5_anual <- dfa |>
+          dplyr::transmute(ano = suppressWarnings(as.integer(.data[[col_ano]])),
+                           precipitacao = suppressWarnings(as.numeric(.data[[col_prec]]))) |>
+          dplyr::filter(is.finite(ano), is.finite(precipitacao)) |>
+          dplyr::arrange(ano)
+      }
+    }
+    if (!tem_era5_precip) {
+      nome_diario <- if ("ERA5_DIARIO" %in% sh) "ERA5_DIARIO" else if (length(sh) >= 1) sh[1] else NA_character_
+      if (!is.na(nome_diario)) {
+        dfd <- readxl::read_excel(arquivo_era5, sheet = nome_diario)
+        names(dfd) <- .normalize_names(names(dfd))
+        col_data <- suppressWarnings(.pick_col(dfd, c("^data$","^date$"), required = FALSE))
+        col_pmm  <- detectar_col_prec_diaria_era5(dfd)
+        if (!is.na(col_data) && !is.na(col_pmm)) {
+          tem_era5_precip <- TRUE
+          era5_diario <- dfd |>
+            dplyr::transmute(
+              data = as.Date(.data[[col_data]]),
+              ano  = lubridate::year(data),
+              mes  = lubridate::month(data),
+              precipitacao_dia = suppressWarnings(as.numeric(.data[[col_pmm]]))
+            ) |>
+            dplyr::filter(!is.na(data))
+          era5_anual <- era5_diario |>
+            dplyr::group_by(ano) |>
+            dplyr::summarise(precipitacao = sum(precipitacao_dia, na.rm = TRUE), .groups="drop")
+        } else {
+          log_warn("ERA5 (XLSX) sem precip detectável.")
+        }
+      }
+    }
+  }
+}
+if (!is.null(era5_anual) && nrow(era5_anual))
+  era5_anual <- .fix_unidade_anual(era5_anual, "precipitacao", "ERA5 (anual)")
+
+if (tem_era5_precip && !is.null(era5_anual) && nrow(era5_anual))
+  readr::write_csv(era5_anual, file.path(DADOS_DIR, "ERA5_ANUAL_padronizado_raw.csv"))
+
+# -------------------- LEITURA ESTAÇÃO (XLSX) ----------------------
+arquivo_estacao <- {
+  cand <- list.files(dados_dir, pattern = "83698.*\\.xlsx$", full.names = TRUE, ignore.case = TRUE)
+  if (!length(cand)) cand <- list.files(project_root, pattern = "83698.*\\.xlsx$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+  if (length(cand)) cand[1] else NA_character_
+}
+if (is.na(arquivo_estacao)) stop("🚩 Não encontrei a planilha da Estação (ex.: dados_83698_*.xlsx).", call. = FALSE)
+
+ler_estacao_diaria <- function(path_xlsx){
+  df0 <- readxl::read_excel(path_xlsx)
+  names(df0) <- .normalize_names(names(df0))
+  col_data <- .pick_col(df0, c("^data$","^date$","^dia$","^data_medicao$"), TRUE)
+  col_p <- suppressWarnings(.pick_col(
+    df0, c("^precipitacao(_?total)?(_?mm)?$","^chuva(_?total)?$","^precip(_?mm)?$","^p_mm$","^p$","^mm$"),
+    required = FALSE
+  ))
+  if (is.na(col_p)) {
+    if (ncol(df0) >= 7) { col_p <- names(df0)[7]; log_warn("Estação: usando coluna índice 7 (G) como precipitação.") }
+    else stop("🚩 Estação: sem coluna de precipitação e sem fallback (G).", call. = FALSE)
+  }
+  out <- df0 |>
+    dplyr::transmute(
+      data = as.Date(.data[[col_data]]),
+      precipitacao_val = suppressWarnings(as.numeric(.data[[col_p]]))
+    ) |>
+    dplyr::filter(!is.na(data)) |>
+    dplyr::mutate(ano = lubridate::year(data),
+                  mes = lubridate::month(data))
+  out_dia <- out |>
+    dplyr::group_by(data, ano, mes) |>
+    dplyr::summarise(precipitacao_dia = sum(precipitacao_val, na.rm = TRUE), .groups="drop")
+  an_med <- out_dia |>
+    dplyr::group_by(ano) |>
+    dplyr::summarise(total = sum(precipitacao_dia, na.rm = TRUE), .groups = "drop")
+  if (nrow(an_med)) {
+    med <- median(an_med$total, na.rm = TRUE)
+    if (med > 20000) stop("🚩 QA falhou: mediana anual da Estação > 20.000 mm.", call. = FALSE)
+    if (med > 10000) { out_dia$precipitacao_dia <- out_dia$precipitacao_dia / 1000; log_info("✅ Estação ÷ 1000 (unidade corrigida).") }
+  }
+  out_dia
+}
+estacao_diaria <- ler_estacao_diaria(arquivo_estacao)
+estacao_anual <- estacao_diaria |>
+  dplyr::mutate(ano = lubridate::year(data)) |>
+  dplyr::group_by(ano) |>
+  dplyr::summarise(precipitacao = sum(precipitacao_dia, na.rm = TRUE), .groups="drop") |>
+  .fix_unidade_anual("precipitacao", "Estacao (anual)")
+
+# -------------------- LEITURA ETA_BESM ----------------------------
+# Preferir arquivo anual pronto (se existir)
+eta_anual  <- NULL
+eta_diario <- NULL
+
+eta_anual_path_candidates <- c(
+  file.path(DADOS_DIR,   "ETA_BESM_ANUAL_1994_2064.csv"),
+  file.path(dados_dir,   "ETA_BESM_ANUAL_1994_2064.csv"),
+  file.path(project_root,"ETA_BESM_ANUAL_1994_2064.csv")
+)
+eta_anual_path <- eta_anual_path_candidates[file.exists(eta_anual_path_candidates)][1]
+
+if (!is.na(eta_anual_path) && length(eta_anual_path)) {
+  log_info(paste("Usando ETA_BESM anual em:", eta_anual_path))
+  eta_anual <- try(readr::read_csv(eta_anual_path, show_col_types = FALSE), silent = TRUE)
+  if (!inherits(eta_anual,"try-error") && nrow(eta_anual)) {
+    names(eta_anual) <- .normalize_names(names(eta_anual))
+    if (!all(c("ano","cenario","precipitacao") %in% names(eta_anual))) {
+      stop("🚩 ETA_BESM anual: colunas esperadas {ano, cenario, precipitacao} não encontradas.", call. = FALSE)
+    }
+    eta_anual$cenario <- .normalize_cenario(eta_anual$cenario)
+    eta_anual <- dplyr::arrange(eta_anual, ano) |>
+      .fix_unidade_anual("precipitacao", fonte="ETA_BESM (anual)")
+  } else {
+    eta_anual <- NULL
+  }
+}
+
+# Se não houver anual pronto, cair para os diários (_daily_campos.csv)
+if (is.null(eta_anual) || !nrow(eta_anual)) {
+  eta_csvs <- if (dir.exists(eta_dir)) list.files(eta_dir, pattern = "_daily_campos\\.csv$", full.names = TRUE, ignore.case = TRUE) else character(0)
+  if (length(eta_csvs)) {
+    log_info(sprintf("Lendo %d arquivos ETA_BESM (diários)…", length(eta_csvs)))
+    lista_eta <- lapply(eta_csvs, function(f){
+      df <- readr::read_csv(f, show_col_types = FALSE)
+      names(df) <- .normalize_names(names(df))
+      col_d <- .pick_col(df, c("^data$","^date$"), TRUE)
+      col_p <- .pick_col(df, c("^mm_dia$","^precipitacao_dia$","^p_mm$","^precip$"), TRUE)
+      dplyr::transmute(df,
+                       data = as.Date(.data[[col_d]]),
+                       precipitacao_dia = suppressWarnings(as.numeric(.data[[col_p]])),
+                       cenario = dplyr::case_when(
+                         stringr::str_detect(tolower(basename(f)),"histor") ~ "Historico",
+                         stringr::str_detect(tolower(basename(f)),"rcp4\\.5|rcp45") ~ "RCP 4.5",
+                         stringr::str_detect(tolower(basename(f)),"rcp8\\.5|rcp85") ~ "RCP 8.5",
+                         TRUE ~ NA_character_
+                       )
+      ) |> dplyr::mutate(ano = lubridate::year(data),
+                         mes = lubridate::month(data))
+    })
+    eta_diario <- dplyr::bind_rows(lista_eta) |> tidyr::drop_na(data)
+    eta_diario <- dplyr::filter(eta_diario, !is.na(cenario))
+    eta_anual <- eta_diario |>
+      dplyr::group_by(ano, cenario) |>
+      dplyr::summarise(precipitacao = sum(precipitacao_dia, na.rm = TRUE), .groups="drop") |>
+      dplyr::mutate(cenario = .normalize_cenario(cenario)) |>
+      dplyr::arrange(ano) |>
+      .fix_unidade_anual("precipitacao", fonte="ETA_BESM (diario→anual)")
+  } else {
+    eta_anual  <- NULL
+    eta_diario <- NULL
+  }
+}
+
+# ==================== RECORTES COERENTES ==========================
+# Historico: 1994–2024 | RCPs: 2006–2064 (ou o que houver)
+era5_anual_hist     <- .limit_anos(era5_anual,    "ano", YEAR_MIN, YEAR_MAX_HIST)
+estacao_anual_hist  <- .limit_anos(estacao_anual, "ano", YEAR_MIN, YEAR_MAX_HIST)
+eta_anual_fut       <- if (!is.null(eta_anual) && nrow(eta_anual))
+  dplyr::filter(eta_anual, ano >= YEAR_MIN, ano <= YEAR_MAX_FUT) else eta_anual
+
+era5_diario_hist    <- if (!is.null(era5_diario)    && nrow(era5_diario))
+  dplyr::filter(era5_diario, ano >= YEAR_MIN, ano <= YEAR_MAX_HIST) else era5_diario
+estacao_diaria_hist <- if (!is.null(estacao_diaria) && nrow(estacao_diaria))
+  dplyr::filter(estacao_diaria, lubridate::year(data) >= YEAR_MIN, lubridate::year(data) <= YEAR_MAX_HIST) else estacao_diaria
+eta_diario_fut      <- if (!is.null(eta_diario)     && nrow(eta_diario))
+  dplyr::filter(eta_diario, ano >= YEAR_MIN, ano <= YEAR_MAX_FUT) else eta_diario
+
+# Exportar bases recortadas (nomes refletem o alcance)
+if (!is.null(era5_anual_hist)    && nrow(era5_anual_hist))     readr::write_csv(era5_anual_hist,    file.path(DADOS_DIR, "ERA5_ANUAL_1994_2024.csv"))
+if (!is.null(estacao_anual_hist) && nrow(estacao_anual_hist))  readr::write_csv(estacao_anual_hist, file.path(DADOS_DIR, "ESTACAO_ANUAL_1994_2024.csv"))
+if (!is.null(eta_anual_fut)      && nrow(eta_anual_fut))       readr::write_csv(eta_anual_fut,      file.path(DADOS_DIR, "ETA_BESM_ANUAL_1994_2064.csv"))
+
+# -------------------- QA / QUALIDADE ------------------------------
+qa_build <- list(
+  ERA5      = if (!is.null(era5_anual_hist)    && nrow(era5_anual_hist))    era5_anual_hist$precipitacao else numeric(0),
+  ESTACAO   = if (!is.null(estacao_anual_hist) && nrow(estacao_anual_hist)) estacao_anual_hist$precipitacao else numeric(0),
+  ETA_BESM  = if (!is.null(eta_anual_fut)      && nrow(eta_anual_fut))      eta_anual_fut$precipitacao else numeric(0)
+)
+qa_resumo <- purrr::imap_dfr(qa_build, function(v, nm){
+  v <- v[is.finite(v)]
+  if (!length(v)) return(tibble::tibble(fonte=nm, n=0, min=NA, q25=NA, med=NA, q75=NA, max=NA))
+  tibble::tibble(fonte = nm, n = length(v),
+                 min=min(v, na.rm=TRUE), q25=quantile(v, 0.25, na.rm=TRUE),
+                 med=median(v, na.rm=TRUE), q75=quantile(v, 0.75, na.rm=TRUE),
+                 max=max(v, na.rm=TRUE))
+})
+readr::write_csv(qa_resumo, file.path(DADOS_DIR, "qa_resumo_unidades_hist1994_2024_rcp2006_2064.csv"))
+if (isTRUE(qa_resumo$med[qa_resumo$fonte=="ESTACAO"] > 20000)) stop("🚩 QA falhou: mediana anual da Estação > 20.000 mm.", call. = FALSE)
+
+# -------------------- BASE UNIFICADA (cenários) -------------------
+historico <- {
+  if (!is.null(era5_anual_hist) && nrow(era5_anual_hist)) {
+    era5_anual_hist |> dplyr::mutate(cenario = "Historico")
+  } else {
+    estacao_anual_hist |> dplyr::mutate(cenario = "Historico")
+  }
+}
+resultado_eta_sel <- if (!is.null(eta_anual_fut) && nrow(eta_anual_fut)) {
+  eta_anual_fut |> dplyr::mutate(cenario = .normalize_cenario(cenario))
+} else tibble::tibble(ano=integer(0), precipitacao=double(0), cenario=character(0))
+
+base_completa <- dplyr::bind_rows(historico, resultado_eta_sel) |>
+  tidyr::drop_na(ano, precipitacao) |>
+  dplyr::filter(cenario %in% c("Historico","RCP 4.5","RCP 8.5"))
+
+# -------------------- ESTATÍSTICAS (MK, Sen, Pettitt) --------------
+.calc_all_stats <- function(x){
+  x <- x[is.finite(x)]
+  if (length(x) < 8) {
+    return(tibble::tibble(
+      tau=NA_real_, pval=NA_real_, slope=NA_real_, slope_p=NA_real_, cp=NA_real_, pett_p=NA_real_
+    ))
+  }
+  mk  <- try(Kendall::MannKendall(x), silent = TRUE)
+  tau <- if (inherits(mk,"try-error")) NA_real_ else unname(mk$tau)
+  pva <- if (inherits(mk,"try-error")) NA_real_ else unname(mk$sl)
+  
+  sen <- try(trend::sens.slope(x), silent = TRUE)
+  slp   <- if (inherits(sen,"try-error")) NA_real_ else suppressWarnings(as.numeric(sen$estimates))[1]
+  slp_p <- if (inherits(sen,"try-error")) NA_real_ else suppressWarnings(as.numeric(sen$p.value))[1]
+  
+  pt  <- try(trend::pettitt.test(x), silent = TRUE)
+  cp  <- if (inherits(pt,"try-error")) NA_real_ else suppressWarnings(as.numeric(pt$estimate))[1]
+  pp  <- if (inherits(pt,"try-error")) NA_real_ else suppressWarnings(as.numeric(pt$p.value))[1]
+  
+  tibble::tibble(tau=tau, pval=pva, slope=slp, slope_p=slp_p, cp=cp, pett_p=pp)
+}
+
+# Forçar janelas: Historico 1994–2024 | RCPs 2006–2064
+series_cenarios <- base_completa |>
+  dplyr::filter(
+    (cenario == "Historico" & ano >= YEAR_MIN & ano <= YEAR_MAX_HIST) |
+      (cenario %in% c("RCP 4.5","RCP 8.5") & ano >= SCEN_MIN & ano <= YEAR_MAX_FUT)
+  ) |>
+  dplyr::group_by(cenario) |>
+  dplyr::arrange(ano, .by_group=TRUE) |>
+  tidyr::nest(dat=c(ano, precipitacao))
+
+# Estatísticas + converter Pettitt cp (índice) -> ano seguro
+stats_cenario <- series_cenarios |>
+  dplyr::mutate(stats = purrr::map(dat, function(df){
+    st <- .calc_all_stats(df$precipitacao)
+    cp_idx <- suppressWarnings(as.integer(round(dplyr::first(st$cp))))
+    if (!is.finite(cp_idx) || is.na(cp_idx) || cp_idx < 1 || cp_idx > nrow(df)) {
+      cp_year <- NA_integer_
+    } else {
+      cp_year <- df$ano[[cp_idx]]
+    }
+    dplyr::bind_cols(st, tibble::tibble(cp_year = cp_year))
+  })) |>
+  tidyr::unnest(stats) |>
+  dplyr::mutate(escopo = "cenario", label = cenario) |>
+  dplyr::select(cenario, escopo, label, tau, pval, slope, slope_p, cp, cp_year, pett_p)
+
+# Bases (janelas coerentes por natureza da fonte)
+stats_base <- list(
+  ERA5     = era5_anual_hist,
+  ESTACAO  = estacao_anual_hist,
+  ETA_BESM = eta_anual_fut
+) |>
+  purrr::imap_dfr(~{
+    df <- .x; nm <- .y
+    if (is.null(df) || !nrow(df)) {
+      return(tibble::tibble(
+        cenario = NA_character_, escopo="base", label = nm,
+        tau=NA_real_, pval=NA_real_, slope=NA_real_, slope_p=NA_real_,
+        cp=NA_real_, cp_year=NA_real_, pett_p=NA_real_
+      ))
+    }
+    st <- .calc_all_stats(df$precipitacao)
+    cp_idx <- suppressWarnings(as.integer(round(dplyr::first(st$cp))))
+    if (!is.finite(cp_idx) || is.na(cp_idx) || cp_idx < 1 || cp_idx > nrow(df)) {
+      cp_year <- NA_integer_
+    } else {
+      cp_year <- df$ano[[cp_idx]]
+    }
+    dplyr::tibble(cenario = NA_character_, escopo="base", label=nm) |>
+      dplyr::bind_cols(st, tibble::tibble(cp_year = cp_year))
+  })
+
+# Consolidado de estatísticas – grava CSV e XLSX
+estatisticas_unificadas <- dplyr::bind_rows(stats_cenario, stats_base)
+readr::write_csv(estatisticas_unificadas, file.path(DADOS_DIR, "estatisticas_unificadas.csv"))
+writexl::write_xlsx(estatisticas_unificadas, path = file.path(DADOS_DIR, "estatisticas_unificadas.xlsx"))
+
+# -------------------- ANOMALIAS -----------------------------------
+# Baseline = média histórica 1994–2024
+baseline_ref <- YEAR_MIN:YEAR_MAX_HIST
+calc_anom <- function(df, ref) {
+  if (is.null(df) || !nrow(df)) return(NULL)
+  clim <- df |> dplyr::filter(ano %in% ref) |>
+    dplyr::summarise(m=mean(precipitacao, na.rm=TRUE), .groups="drop") |> dplyr::pull(m)
+  df |> dplyr::mutate(anomalia = precipitacao - clim)
+}
+anom_era5     <- if (!is.null(era5_anual_hist)     && nrow(era5_anual_hist))     calc_anom(era5_anual_hist,     baseline_ref) else NULL
+anom_eta_besm <- if (!is.null(eta_anual_fut)       && nrow(eta_anual_fut))       calc_anom(eta_anual_fut,       baseline_ref) else NULL
+anom_estacao  <- if (!is.null(estacao_anual_hist)  && nrow(estacao_anual_hist))  calc_anom(estacao_anual_hist,  baseline_ref) else NULL
+
+# -------------------- GRÁFICOS (fundo branco) ---------------------
+base_theme <- ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    text = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.text = element_text(color = "black"),
+    legend.title = element_text(color = "black"),
+    plot.title = element_text(face="bold")
+  )
+fonte_pal   <- c("ERA5"="#0B3C5D","ETA_BESM"="#1F6FB2","Estação"="#6AA3D8")
+azul_barra  <- "#1F6FB2"
+heat_low    <- "#E6F0FA"
+heat_high   <- "#0B3C5D"
+cenario_pal <- c("Historico"="#0B3C5D", "RCP 4.5"="#3E88C5", "RCP 8.5"="#9CC3E6")
+
+# 1) Anomalia por cenário (Historico 1994–2024; RCPs 2006–2064)
+base_cenarios_plot <- dplyr::bind_rows(
+  dplyr::filter(historico, ano >= YEAR_MIN & ano <= YEAR_MAX_HIST),
+  dplyr::filter(resultado_eta_sel, cenario %in% c("RCP 4.5","RCP 8.5"),
+                ano >= SCEN_MIN & ano <= YEAR_MAX_FUT)
+)
+media_hist_baseline <- historico |>
+  dplyr::filter(ano %in% (YEAR_MIN:YEAR_MAX_HIST)) |>
+  dplyr::summarise(m=mean(precipitacao, na.rm=TRUE), .groups="drop") |>
+  dplyr::pull(m)
+media_anual_cenarios <- base_cenarios_plot |>
+  dplyr::group_by(ano, cenario) |>
+  dplyr::summarise(media = mean(precipitacao, na.rm=TRUE), .groups="drop")
+anomalia_cenarios <- media_anual_cenarios |>
+  dplyr::mutate(anomalia = media - media_hist_baseline)
+cap_cenarios <- try({
+  stats_cenario |>
+    dplyr::transmute(lbl = sprintf(
+      "%s: MK τ=%.2f (p=%.1e), Sen=%.2f mm/ano; Pettitt cp=ano %s (p=%.1e)",
+      label, tau, pval, slope,
+      ifelse(is.finite(cp_year), as.integer(cp_year), NA),
+      pett_p
+    )) |>
+    dplyr::pull(lbl) |>
+    paste(collapse = "  |  ")
+}, silent = TRUE); if (inherits(cap_cenarios,"try-error")) cap_cenarios <- NULL
+
+g1 <- ggplot2::ggplot(anomalia_cenarios, aes(x=ano, y=anomalia, color=cenario)) +
+  geom_hline(yintercept=0, linetype="dashed", color="grey65") +
+  geom_line(linewidth=1) + geom_point(size=1.8) +
+  scale_color_manual(values=cenario_pal) +
+  scale_x_continuous(limits = c(YEAR_MIN, YEAR_MAX_FUT), breaks = seq(YEAR_MIN, YEAR_MAX_FUT, by = 4)) +
+  labs(title="Anomalia anual de precipitação por cenário (Baseline: Historico 1994–2024)",
+       x="Ano", y="Anomalia (mm)", color="Cenário",
+       caption = paste0("Historico: 1994–2024 | RCPs: 2006–2064.  ",
+                        if (!is.null(cap_cenarios)) cap_cenarios else "")) +
+  base_theme
+ggplot2::ggsave(file.path(OUT_DIR, "anomalia_precipitacao_cenarios_1994_2024_vs_2006_2064.png"), g1, width=11, height=5.5, dpi=300)
+
+# 2) Anomalias individuais (coerentes com cada fonte)
+plot_anom <- function(df, titulo, fname, min_year, max_year, ref_caption){
+  if (is.null(df) || !nrow(df)) return(invisible(NULL))
+  g <- ggplot2::ggplot(dplyr::filter(df, ano >= min_year, ano <= max_year), aes(x=ano, y=anomalia)) +
+    geom_hline(yintercept=0, linetype="dashed", color="grey65") +
+    geom_col(fill=azul_barra) +
+    scale_x_continuous(limits = c(min_year, max_year), breaks = seq(min_year, max_year, by = 2)) +
+    labs(title=titulo, x="Ano", y="Anomalia (mm)", caption = ref_caption) +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, fname), g, width=10, height=5.2, dpi=300)
+}
+if (!is.null(anom_era5))     plot_anom(anom_era5,     "Anomalia – ERA5",                     "anomalia_era5_ref_1994_2024.png",     YEAR_MIN, YEAR_MAX_HIST, "Baseline: 1994–2024 (ERA5/Historico).")
+if (!is.null(anom_eta_besm)) plot_anom(anom_eta_besm, "Anomalia – ETA_BESM",                 "anomalia_eta_besm_ref_1994_2064.png", YEAR_MIN, YEAR_MAX_FUT,  "Baseline: 1994–2024 (Historico).")
+if (!is.null(anom_estacao))  plot_anom(anom_estacao,  "Anomalia – Estação (Campos, 83698)", "anomalia_estacao_ref_1994_2024.png",  YEAR_MIN, YEAR_MAX_HIST, "Baseline: 1994–2024 (Estação).")
+
+# 3) Comparativo histórico (1994–2024) entre fontes
+era5_comp    <- if (!is.null(era5_anual_hist)    && nrow(era5_anual_hist))    era5_anual_hist    |> dplyr::transmute(ano, valor = precipitacao, Fonte = "ERA5")     else tibble::tibble()
+eta_comp_hst <- if (!is.null(eta_anual_fut)      && nrow(eta_anual_fut))      dplyr::filter(eta_anual_fut, ano <= YEAR_MAX_HIST) |> dplyr::transmute(ano, valor = precipitacao, Fonte = "ETA_BESM") else tibble::tibble()
+estacao_comp <- if (!is.null(estacao_anual_hist) && nrow(estacao_anual_hist)) estacao_anual_hist |> dplyr::transmute(ano, valor = precipitacao, Fonte = "Estação") else tibble::tibble()
+comp_1994_2024 <- dplyr::bind_rows(era5_comp, eta_comp_hst, estacao_comp) |>
+  dplyr::filter(ano >= YEAR_MIN, ano <= YEAR_MAX_HIST) |>
+  tidyr::drop_na()
+
+cap_bases <- try({
+  dplyr::bind_rows(stats_base) |>
+    dplyr::transmute(lbl = sprintf("%s: MK τ=%.2f (p=%.1e), Sen=%.2f mm/ano; Pettitt cp=ano %s (p=%.1e)",
+                                   label, tau, pval, slope,
+                                   ifelse(is.finite(cp_year), as.integer(cp_year), NA), pett_p)) |>
+    dplyr::pull(lbl) |>
+    paste(collapse = "  |  ")
+}, silent = TRUE); if (inherits(cap_bases,"try-error")) cap_bases <- NULL
+
+if (nrow(comp_1994_2024)) {
+  g2 <- ggplot2::ggplot(comp_1994_2024, aes(x = ano, y = valor, color = Fonte)) +
+    geom_line(linewidth=1) + geom_point(size=1.8) +
+    scale_color_manual(values=fonte_pal) +
+    scale_x_continuous(limits = c(YEAR_MIN, YEAR_MAX_HIST), breaks = seq(YEAR_MIN, YEAR_MAX_HIST, by = 2)) +
+    labs(title="Precipitação anual – Fontes disponíveis (1994–2024)",
+         x="Ano", y="mm/ano", color="Fonte",
+         caption = cap_bases) +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, "comparativo_tres_fontes_1994_2024.png"), g2, width=12, height=6, dpi=300)
+}
+
+# -------------------- PRODUTOS MENSAIS (se houver diário) ----------
+make_month_table <- function(diario_df, min_year, max_year){
+  if (is.null(diario_df) || !nrow(diario_df)) return(tibble::tibble())
+  diario_df |>
+    dplyr::transmute(ano = lubridate::year(data),
+                     mes = lubridate::month(data),
+                     p   = precipitacao_dia) |>
+    dplyr::filter(ano >= min_year, ano <= max_year) |>
+    dplyr::group_by(ano, mes) |>
+    dplyr::summarise(mm = sum(p, na.rm = TRUE), .groups="drop")
+}
+plot_heatmap_mensal <- function(tab_mensal, titulo, fname){
+  if (is.null(tab_mensal) || !nrow(tab_mensal)) return(invisible(NULL))
+  g <- ggplot2::ggplot(tab_mensal, aes(x = factor(mes), y = factor(ano), fill = mm)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient(low = heat_low, high = heat_high, name = "mm/mês") +
+    labs(title=titulo, x="Mês", y="Ano") +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, fname), g, width=10, height=6.5, dpi=300)
+}
+plot_clima_mensal <- function(tab_mensal, titulo, fname){
+  if (is.null(tab_mensal) || !nrow(tab_mensal)) return(invisible(NULL))
+  clim <- tab_mensal |>
+    dplyr::group_by(mes) |>
+    dplyr::summarise(media = mean(mm, na.rm = TRUE),
+                     p25   = quantile(mm, 0.25, na.rm = TRUE),
+                     p75   = quantile(mm, 0.75, na.rm = TRUE), .groups="drop")
+  g <- ggplot2::ggplot(clim, aes(x=factor(mes), y=media)) +
+    geom_col(fill = heat_high, alpha = 0.85) +
+    geom_errorbar(aes(ymin=p25, ymax=p75), width=0.2, color="grey25") +
+    labs(title=titulo, x="Mês", y="Precipitação (mm/mês)") +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, fname), g, width=10, height=5.2, dpi=300)
+}
+plot_box_decadas <- function(tab_mensal, titulo, fname){
+  if (is.null(tab_mensal) || !nrow(tab_mensal)) return(invisible(NULL))
+  dfb <- tab_mensal |>
+    dplyr::mutate(decada = paste0(floor(ano/10)*10, "s"),
+                  mes_f  = factor(mes, levels = 1:12))
+  g <- ggplot2::ggplot(dfb, aes(x = mes_f, y = mm, group = mes_f)) +
+    geom_boxplot(fill = heat_low, color = heat_high, outlier.alpha = 0.4) |
+    facet_wrap(~ decada, ncol = 3, scales = "free_y") +
+    labs(title = titulo, x = "Mês", y = "mm/mês") +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, fname), g, width = 12, height = 7, dpi = 300)
+}
+plot_media_movel <- function(df_anual, label, fname, min_year, max_year, cor="#3b6ea8"){
+  if (is.null(df_anual) || !nrow(df_anual)) return(invisible(NULL))
+  df <- df_anual |> dplyr::filter(ano >= min_year, ano <= max_year) |>
+    dplyr::arrange(ano) |>
+    dplyr::mutate(mm5 = zoo::rollmean(precipitacao, 5, align="center", fill = NA))
+  g <- ggplot2::ggplot(df, aes(x = ano)) +
+    geom_line(aes(y = precipitacao), color = "grey55", linewidth = 0.7) +
+    geom_point(aes(y = precipitacao), color = "grey55", size = 1.4) +
+    geom_line(aes(y = mm5), color = cor, linewidth = 1.6) +
+    scale_x_continuous(limits = c(min_year, max_year), breaks = seq(min_year, max_year, by = 2)) +
+    labs(title = paste0("Média móvel (5 anos) – ", label),
+         x = "Ano", y = "mm/ano",
+         caption = "Linha cinza: série anual; Linha colorida: média móvel centrada de 5 anos") +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, fname), g, width=11, height=5.5, dpi=300)
+}
+
+# Estação (diário Historico)
+mensal_estacao <- make_month_table(estacao_diaria_hist, YEAR_MIN, YEAR_MAX_HIST)
+if (nrow(mensal_estacao)) {
+  readr::write_csv(mensal_estacao, file.path(DADOS_DIR, "ESTACAO_MENSAL_1994_2024.csv"))
+  plot_heatmap_mensal(mensal_estacao, "Heatmap de precipitação mensal – Estação (83698)", "heatmap_mensal_estacao.png")
+  plot_clima_mensal(mensal_estacao, "Climatologia mensal – Estação (83698)", "climatologia_mensal_estacao.png")
+  plot_box_decadas(mensal_estacao, "Boxplots mensais por década – Estação (83698)", "boxplots_decadas_estacao.png")
+  plot_media_movel(estacao_anual_hist, "Estação (83698)", "media_movel5_estacao.png", YEAR_MIN, YEAR_MAX_HIST, cor=fonte_pal["Estação"])
+}
+
+# ERA5 (se diário disponível – Historico)
+if (!is.null(era5_diario_hist) && nrow(era5_diario_hist)) {
+  mensal_era5 <- make_month_table(era5_diario_hist, YEAR_MIN, YEAR_MAX_HIST)
+  if (nrow(mensal_era5)) {
+    readr::write_csv(mensal_era5, file.path(DADOS_DIR, "ERA5_MENSAL_1994_2024.csv"))
+    plot_heatmap_mensal(mensal_era5, "Heatmap de precipitação mensal – ERA5", "heatmap_mensal_era5.png")
+    plot_clima_mensal(mensal_era5, "Climatologia mensal – ERA5", "climatologia_mensal_era5.png")
+    plot_box_decadas(mensal_era5, "Boxplots mensais por década – ERA5", "boxplots_decadas_era5.png")
+  }
+  if (!is.null(era5_anual_hist) && nrow(era5_anual_hist))
+    plot_media_movel(era5_anual_hist, "ERA5", "media_movel5_era5.png", YEAR_MIN, YEAR_MAX_HIST, cor=fonte_pal["ERA5"])
+} else if (!is.na(arquivo_era5)) {
+  log_warn("ERA5 sem diário de precipitação — produtos mensais de ERA5 não serão gerados.")
+}
+
+# ETA_BESM (diário e/ou anual – futuro até 2064)
+if (!is.null(eta_diario_fut) && nrow(eta_diario_fut)) {
+  mensal_eta <- eta_diario_fut |>
+    dplyr::mutate(ano=lubridate::year(data), mes=lubridate::month(data)) |>
+    dplyr::filter(ano >= YEAR_MIN, ano <= YEAR_MAX_FUT) |>
+    dplyr::group_by(ano, mes, cenario) |>
+    dplyr::summarise(mm = sum(precipitacao_dia, na.rm=TRUE), .groups="drop")
+  readr::write_csv(mensal_eta, file.path(DADOS_DIR, "ETA_BESM_MENSAL_1994_2064.csv"))
+  for (cen in unique(mensal_eta$cenario)) {
+    tab <- mensal_eta |> dplyr::filter(cenario==cen)
+    if (nrow(tab)) {
+      g <- ggplot2::ggplot(tab, aes(x=factor(mes), y=factor(ano), fill=mm)) +
+        geom_tile(color="white") +
+        scale_fill_gradient(low = heat_low, high = heat_high, name = "mm/mês") +
+        labs(title=paste("Heatmap de precipitação mensal – ETA_BESM (", cen, ")", sep=""),
+             x="Mês", y="Ano") + base_theme
+      ggplot2::ggsave(file.path(OUT_DIR, paste0("heatmap_mensal_eta_besm_", gsub("[^0-9A-Za-z]+","_", cen), ".png")),
+                      g, width=10, height=6.5, dpi=300)
+    }
+  }
+}
+if (!is.null(eta_anual_fut) && nrow(eta_anual_fut)) {
+  plot_media_movel(eta_anual_fut, "ETA_BESM", "media_movel5_eta_besm_1994_2064.png", YEAR_MIN, YEAR_MAX_FUT, cor=fonte_pal["ETA_BESM"])
+}
+
+# -------------------- GRÁFICOS COMPARATIVOS ADICIONAIS ------------
+# (A) Boxplot anual por fonte (janelas coerentes)
+era5_comp_box    <- if (!is.null(era5_anual_hist)    && nrow(era5_anual_hist))    dplyr::transmute(era5_anual_hist,    ano, precipitacao, Fonte = "ERA5")     else NULL
+estacao_comp_box <- if (!is.null(estacao_anual_hist) && nrow(estacao_anual_hist)) dplyr::transmute(estacao_anual_hist, ano, precipitacao, Fonte = "Estação") else NULL
+eta_comp_box     <- if (!is.null(eta_anual_fut)      && nrow(eta_anual_fut))      dplyr::transmute(eta_anual_fut,      ano, precipitacao, Fonte = "ETA_BESM") else NULL
+
+comp_box <- dplyr::bind_rows(era5_comp_box, estacao_comp_box, eta_comp_box)
+if (!nrow(comp_box)) stop("Sem dados para compor boxplot.")
+
+print(table(comp_box$Fonte))  # diagnóstico no console
+readr::write_csv(comp_box, file.path(DADOS_DIR, "boxplot_insumo_comp_box_hist1994_2024_rcp1994_2064.csv"))
+
+fontes_esperadas <- c("ERA5","Estação","ETA_BESM")
+faltaram <- setdiff(fontes_esperadas, unique(comp_box$Fonte))
+if (length(faltaram)) log_warn(paste("Fontes ausentes no boxplot:", paste(faltaram, collapse=", ")))
+
+g_box <- ggplot2::ggplot(comp_box, aes(x=Fonte, y=precipitacao, fill=Fonte)) +
+  geom_boxplot(alpha=0.9, outlier.alpha = 0.4) +
+  scale_fill_manual(values = c("ERA5"="#0B3C5D","ETA_BESM"="#1F6FB2","Estação"="#6AA3D8")) +
+  labs(title="Distribuição anual de precipitação por Fonte (Hist: 1994–2024 | Cenários: até 2064)", x=NULL, y="mm/ano") +
+  base_theme
+ggplot2::ggsave(file.path(OUT_DIR, "boxplot_anual_fontes_hist1994_2024_rcp_ate_2064.png"), g_box, width=8.5, height=6, dpi=300)
+
+# (B) Densidade anual por fonte
+if (nrow(comp_box)) {
+  g_den <- ggplot2::ggplot(comp_box, aes(x=precipitacao, color=Fonte)) +
+    geom_density(linewidth=1.1) +
+    scale_color_manual(values=fonte_pal) +
+    labs(title="Densidade das somas anuais por Fonte (Hist 1994–2024; Cenários até 2064)", x="mm/ano", y="Densidade") +
+    base_theme
+  ggplot2::ggsave(file.path(OUT_DIR, "densidade_anual_fontes_hist1994_2024_rcp_ate_2064.png"), g_den, width=10, height=5.5, dpi=300)
+}
+
+# (C) Dispersões (pareados) – Historico
+if (!is.null(era5_anual_hist) && nrow(era5_anual_hist)) {
+  pareado_era5 <- dplyr::inner_join(
+    era5_anual_hist    |> dplyr::select(ano, ERA5=precipitacao),
+    estacao_anual_hist |> dplyr::select(ano, EST=precipitacao),
+    by="ano"
+  ) |> tidyr::drop_na() |> dplyr::filter(ano >= YEAR_MIN, ano <= YEAR_MAX_HIST)
+  if (nrow(pareado_era5) >= 5) {
+    r <- suppressWarnings(cor(pareado_era5$ERA5, pareado_era5$EST, use="complete.obs"))
+    bias  <- mean(pareado_era5$ERA5 - pareado_era5$EST, na.rm=TRUE)
+    rmse  <- sqrt(mean((pareado_era5$ERA5 - pareado_era5$EST)^2, na.rm=TRUE))
+    cap <- sprintf("r=%.2f | viés=%.1f mm/ano | RMSE=%.1f mm/ano (1994–2024)", r, bias, rmse)
+    g_sc1 <- ggplot2::ggplot(pareado_era5, aes(x=EST, y=ERA5)) +
+      geom_abline(slope=1, intercept=0, linetype="dashed", color="grey50") +
+      geom_point(color=fonte_pal["ERA5"], size=2) +
+      geom_smooth(method="lm", se=FALSE, color="black", linewidth=1) +
+      labs(title="Dispersão anual: ERA5 vs Estação (anos pareados)",
+           x="Estação (mm/ano)", y="ERA5 (mm/ano)", caption=cap) +
+      base_theme
+    ggplot2::ggsave(file.path(OUT_DIR, "dispersao_ERA5_vs_Estacao.png"), g_sc1, width=8.5, height=6, dpi=300)
+    readr::write_csv(pareado_era5, file.path(DADOS_DIR, "pareado_ERA5_vs_ESTACAO_1994_2024.csv"))
+  }
+}
+if (!is.null(eta_anual_fut) && nrow(eta_anual_fut)) {
+  eta_hist <- eta_anual_fut |> dplyr::filter(cenario=="Historico", ano <= YEAR_MAX_HIST)
+  if (nrow(eta_hist)) {
+    pareado_eta <- dplyr::inner_join(
+      eta_hist            |> dplyr::select(ano, ETA=precipitacao),
+      estacao_anual_hist  |> dplyr::select(ano, EST=precipitacao),
+      by="ano"
+    ) |> tidyr::drop_na() |> dplyr::filter(ano >= YEAR_MIN, ano <= YEAR_MAX_HIST)
+    if (nrow(pareado_eta) >= 5) {
+      r <- suppressWarnings(cor(pareado_eta$ETA, pareado_eta$EST, use="complete.obs"))
+      bias  <- mean(pareado_eta$ETA - pareado_eta$EST, na.rm=TRUE)
+      rmse  <- sqrt(mean((pareado_eta$ETA - pareado_eta$EST)^2, na.rm=TRUE))
+      cap <- sprintf("r=%.2f | viés=%.1f mm/ano | RMSE=%.1f mm/ano (1994–2024)", r, bias, rmse)
+      g_sc2 <- ggplot2::ggplot(pareado_eta, aes(x=EST, y=ETA)) +
+        geom_abline(slope=1, intercept=0, linetype="dashed", color="grey50") +
+        geom_point(color=fonte_pal["ETA_BESM"], size=2) +
+        geom_smooth(method="lm", se=FALSE, color="black", linewidth=1) +
+        labs(title="Dispersão anual: ETA_BESM (Historico) vs Estação (anos pareados)",
+             x="Estação (mm/ano)", y="ETA_BESM (mm/ano)", caption=cap) +
+        base_theme
+      ggplot2::ggsave(file.path(OUT_DIR, "dispersao_ETA_Historico_vs_Estacao.png"), g_sc2, width=8.5, height=6, dpi=300)
+      readr::write_csv(pareado_eta, file.path(DADOS_DIR, "pareado_ETA_HIST_vs_ESTACAO_1994_2024.csv"))
+    }
+  }
+}
+
+# -------------------- TAYLOR DIAGRAM e QQ-PLOT (Historico) --------
+if (!is.null(era5_anual_hist) && nrow(era5_anual_hist) && requireNamespace("plotrix", quietly = TRUE)) {
+  pareado <- dplyr::inner_join(
+    era5_anual_hist    |> dplyr::select(ano, era5 = precipitacao),
+    estacao_anual_hist |> dplyr::select(ano, est = precipitacao),
+    by = "ano"
+  ) |> tidyr::drop_na() |> dplyr::filter(ano >= YEAR_MIN, ano <= YEAR_MAX_HIST)
+  if (nrow(pareado) >= 5) {
+    png(filename = file.path(OUT_DIR, "taylor_diagram_era5_estacao_hist_1994_2024.png"),
+        width = 1100, height = 700, res = 120)
+    par(bg = "white")
+    plotrix::taylor.diagram(ref = pareado$est,
+                            model = pareado$era5,
+                            main = "Taylor diagram – ERA5 vs Estação (anuais pareados, 1994–2024)",
+                            pch = 19, col = "#3b6ea8")
+    dev.off()
+    # QQ-plot
+    q <- seq(0.01, 0.99, by = 0.01)
+    q_era5 <- quantile(pareado$era5, q, na.rm = TRUE)
+    q_est  <- quantile(pareado$est,  q, na.rm = TRUE)
+    dfqq <- tibble::tibble(era5 = as.numeric(q_era5), est = as.numeric(q_est))
+    gqq <- ggplot2::ggplot(dfqq, aes(x = era5, y = est)) +
+      geom_point(color = "#3b6ea8", size = 2) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+      labs(title = "QQ-plot empírico – ERA5 vs Estação (anuais, 1994–2024)",
+           x = "Quantis ERA5 (mm/ano)", y = "Quantis Estação (mm/ano)") +
+      base_theme
+    ggplot2::ggsave(file.path(OUT_DIR, "qqplot_era5_vs_estacao_hist_1994_2024.png"), gqq, width = 10, height = 6, dpi = 300)
+  } else {
+    log_warn("Pontos insuficientes para Taylor/QQ (precisa >= 5 anos pareados).")
+  }
+} else if (!is.null(era5_anual_hist) && nrow(era5_anual_hist)) {
+  log_warn("Pacote 'plotrix' indisponível — Taylor diagram não será gerado.")
+}
+
+# -------------------- RELATÓRIOS DE QUALIDADE --------------------
+.qual_vec <- function(v){
+  v_num <- suppressWarnings(as.numeric(v))
+  n_    <- length(v_num)
+  z_    <- sum(v_num == 0, na.rm = TRUE)
+  na_   <- sum(!is.finite(v_num))
+  frac_z <- ifelse(n_ > 0, z_ / n_, NA_real_)
+  frac_na <- ifelse(n_ > 0, na_ / n_, NA_real_)
+  tibble::tibble(
+    n = n_,
+    zeros = z_,
+    zeros_frac = frac_z,                    # 0–1
+    zeros_pct  = round(100 * frac_z, 2),    # %
+    na = na_,
+    na_frac = frac_na,                      # 0–1
+    na_pct  = round(100 * frac_na, 2)       # %
+  )
+}
+
+qualidade_overall <- list()
+
+if (!is.null(era5_anual_hist) && nrow(era5_anual_hist)) {
+  q <- .qual_vec(era5_anual_hist$precipitacao); qualidade_overall$ERA5_anual <- dplyr::mutate(q, base="ERA5", nivel="anual")
+}
+if (!is.null(estacao_anual_hist) && nrow(estacao_anual_hist)) {
+  q <- .qual_vec(estacao_anual_hist$precipitacao); qualidade_overall$ESTACAO_anual <- dplyr::mutate(q, base="Estacao", nivel="anual")
+}
+if (!is.null(eta_anual_fut) && nrow(eta_anual_fut)) {
+  q <- .qual_vec(eta_anual_fut$precipitacao); qualidade_overall$ETA_BESM_anual <- dplyr::mutate(q, base="ETA_BESM", nivel="anual")
+}
+if (!is.null(era5_diario_hist) && nrow(era5_diario_hist)) {
+  q <- .qual_vec(era5_diario_hist$precipitacao_dia); qualidade_overall$ERA5_diario <- dplyr::mutate(q, base="ERA5", nivel="diario")
+}
+if (!is.null(estacao_diaria_hist) && nrow(estacao_diaria_hist)) {
+  q <- .qual_vec(estacao_diaria_hist$precipitacao_dia); qualidade_overall$ESTACAO_diario <- dplyr::mutate(q, base="Estacao", nivel="diario")
+}
+if (!is.null(eta_diario_fut) && nrow(eta_diario_fut)) {
+  q <- .qual_vec(eta_diario_fut$precipitacao_dia); qualidade_overall$ETA_BESM_diario <- dplyr::mutate(q, base="ETA_BESM", nivel="diario")
+}
+
+qualidade_overview <- dplyr::bind_rows(qualidade_overall) |>
+  dplyr::select(nivel, base, n, zeros, zeros_frac, zeros_pct, na, na_frac, na_pct)
+
+readr::write_csv(qualidade_overview, file.path(DADOS_DIR, "qualidade_overview_zeros_na.csv"))
+writexl::write_xlsx(qualidade_overview, path = file.path(DADOS_DIR, "qualidade_overview_zeros_na.xlsx"))
+
+# Qualidade por cenário (ETA_BESM anual)
+if (!is.null(eta_anual_fut) && nrow(eta_anual_fut)) {
+  qualidade_eta_cenario_anual <- eta_anual_fut |>
+    dplyr::group_by(cenario) |>
+    dplyr::summarise(
+      n = dplyr::n(),
+      zeros = sum(precipitacao == 0, na.rm = TRUE),
+      zeros_frac = zeros / n,
+      zeros_pct  = round(100 * zeros_frac, 2),
+      na = sum(!is.finite(precipitacao)),
+      na_frac = na / n,
+      na_pct  = round(100 * na_frac, 2),
+      .groups="drop"
+    )
+  readr::write_csv(qualidade_eta_cenario_anual, file.path(DADOS_DIR, "qualidade_eta_cenario_anual.csv"))
+  writexl::write_xlsx(qualidade_eta_cenario_anual, path = file.path(DADOS_DIR, "qualidade_eta_cenario_anual.xlsx"))
+}
+
+log_info("✅ Pipeline concluído (Historico: 1994–2024; RCPs: 2006–2064; anomalias com baseline 1994–2024; Pettitt em ano; XLSX gerados).")
