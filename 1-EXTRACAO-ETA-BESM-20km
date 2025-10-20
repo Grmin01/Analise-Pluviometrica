@@ -1,0 +1,200 @@
+# ================================================================
+# ETA_BESM_20km -> EXTRAÇÃO DIÁRIA (mm/dia) PARA CAMPOS
+# Robusto a diferentes ordens de dimensão e unidades; evita colunas-lista
+# ================================================================
+
+suppressPackageStartupMessages({
+  for (p in c("ncdf4","dplyr","readr","stringr","lubridate","tibble")) {
+    if (!require(p, character.only=TRUE)) { install.packages(p); library(p, character.only=TRUE) }
+  }
+})
+
+# --------- CONFIG --------------------------------------------------
+project_root <- "C:/Users/alexs/OneDrive/Área de Trabalho/clima_campos"
+eta_dir      <- file.path(project_root, "Eta_BESM_20km")
+
+# BBOX (Campos)
+lat_range <- c(-22, -21)
+lon_range <- c(-42, -41)
+
+# --------- UTILS / LOG --------------------------------------------
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+
+log_ok   <- function(x) cat(sprintf("🟢 %s\n", x))
+log_warn <- function(x) cat(sprintf("🟡 %s\n", x))
+log_err  <- function(x) cat(sprintf("🔴 %s\n", x))
+
+# normaliza bbox para grade (0..360 vs -180..180)
+norm_bbox_to_grid <- function(lon_vec, lon_rng) {
+  if (max(lon_vec, na.rm=TRUE) > 180) {    # arquivo em 0..360
+    rng <- ifelse(lon_rng < 0, lon_rng + 360, lon_rng)
+  } else {                                  # arquivo em -180..180
+    rng <- ifelse(lon_rng > 180, lon_rng - 360, lon_rng)
+  }
+  range(rng)
+}
+
+# decode do eixo de tempo (força vetor!)
+decode_time <- function(time_vals, time_units) {
+  time_vals <- as.vector(time_vals)  # <- crítico p/ evitar matriz
+  u <- tolower(gsub("\\s+", " ", time_units))
+  m <- regexpr("(seconds|second|secs|sec|minutes|minute|min|hours|hour|days|day) since\\s*([0-9\\-: ]+)", u, perl=TRUE)
+  if (m < 0) stop(sprintf("Unidade de tempo não reconhecida: '%s'", time_units))
+  unit <- sub(" since.*$", "", substring(u, m, m + attr(m, "match.length") - 1))
+  since_str <- sub(".* since\\s*", "", u)
+  origin <- as.POSIXct(since_str, tz="UTC")
+  mult <- switch(unit,
+                 "seconds"=1,"second"=1,"secs"=1,"sec"=1,
+                 "minutes"=60,"minute"=60,"min"=60,
+                 "hours"=3600,"hour"=3600,
+                 "days"=86400,"day"=86400,
+                 NA)
+  if (is.na(mult)) stop(sprintf("Granularidade de tempo não suportada: '%s'", unit))
+  as.Date(origin + time_vals * mult, tz="UTC")
+}
+
+mean_na <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm=TRUE)
+
+find_pr_var <- function(nc) {
+  vn <- names(nc$var)
+  vnl <- tolower(vn)
+  ix <- match(TRUE, vnl %in% c("pr","precip","precipitation","tp"))
+  if (!is.na(ix)) return(vn[ix])
+  for (v in vn) {  # fallback por unidade
+    un <- tolower(ncdf4::ncatt_get(nc, v, "units")$value %||% "")
+    if (grepl("mm", un) || grepl("kg.*m-2.*s-1", un)) return(v)
+  }
+  stop("Não encontrei variável de precipitação (pr/precip/tp).")
+}
+
+to_mm_per_day <- function(values, units_text) {
+  u <- tolower(units_text %||% "")
+  u <- gsub(",", ".", u)
+  u <- gsub("\\s+", " ", u)
+  if (grepl("kg", u) && grepl("m-2", u) && grepl("s-1|s\\^-1", u)) return(values * 86400) # kg m-2 s-1 -> mm/dia
+  if (grepl("mm/?day|mm dia|mm d-1|mm/day|mm per day", u))         return(values)          # já mm/dia
+  if (grepl("mm/?hour|mm h-1|mm/hour|mm per hour", u))             return(values * 24)     # mm/h -> mm/dia
+  if (grepl("mm\\s*/\\s*dia|mm\\s*por\\s*dia", u))                 return(values)
+  if (grepl("mm", u) && !grepl("per|/| s-1| h-1| d-1|day|hour", u)) {
+    log_warn("Unidade 'mm' ambígua; assumindo mm/dia.")
+    return(values)
+  }
+  log_warn(sprintf("Unidade '%s' não reconhecida; NÃO converti (assumo mm/dia).", units_text))
+  values
+}
+
+sanity_fix <- function(mm_day_vec) {
+  med <- suppressWarnings(median(mm_day_vec, na.rm=TRUE))
+  if (is.finite(med) && med > 100) {
+    mm2 <- mm_day_vec / 86400
+    med2 <- suppressWarnings(median(mm2, na.rm=TRUE))
+    if (is.finite(med2) && med2 < 50) {
+      log_warn("Mediana >100 mm/dia; ajustei dividindo por 86.400 (provável conversão dupla).")
+      return(mm2)
+    }
+  }
+  mm_day_vec
+}
+
+# leitura segura 3D via nomes de dimensão (evita colunas-lista)
+extract_eta_daily_one <- function(nc_path, lat_range, lon_range) {
+  nc <- try(ncdf4::nc_open(nc_path), silent=TRUE)
+  if (inherits(nc,"try-error")) stop("Falha ao abrir NetCDF.")
+  on.exit(try(ncdf4::nc_close(nc), silent=TRUE), add=TRUE)
+  
+  vname <- find_pr_var(nc)
+  
+  # eixos
+  lat <- try(ncdf4::ncvar_get(nc, "lat"), silent=TRUE)
+  if (inherits(lat,"try-error")) lat <- try(ncdf4::ncvar_get(nc, "latitude"), silent=TRUE)
+  lon <- try(ncdf4::ncvar_get(nc, "lon"), silent=TRUE)
+  if (inherits(lon,"try-error")) lon <- try(ncdf4::ncvar_get(nc, "longitude"), silent=TRUE)
+  if (inherits(lat,"try-error") || inherits(lon,"try-error")) stop("Não encontrei variáveis lat/lon.")
+  
+  lon_box <- norm_bbox_to_grid(as.vector(lon), lon_range)
+  lat_idx <- which(as.vector(lat) >= min(lat_range) & as.vector(lat) <= max(lat_range))
+  lon_idx <- which(as.vector(lon) >= min(lon_box)   & as.vector(lon) <= max(lon_box))
+  if (!length(lat_idx) || !length(lon_idx)) stop("BBox não cruza a grade do arquivo.")
+  
+  time_vals  <- ncdf4::ncvar_get(nc, "time")
+  time_units <- ncdf4::ncatt_get(nc, "time", "units")$value %||% "days since 1900-01-01"
+  datas      <- decode_time(time_vals, time_units)   # <- já vetor Date
+  nt <- length(datas)
+  
+  vinfo <- nc$var[[vname]]
+  dim_names <- tolower(vapply(vinfo$dim, function(d) d$name, character(1)))
+  pos_time <- match(TRUE, dim_names %in% c("time","t"))
+  pos_lat  <- match(TRUE, dim_names %in% c("lat","latitude","y"))
+  pos_lon  <- match(TRUE, dim_names %in% c("lon","longitude","x"))
+  if (any(is.na(c(pos_time,pos_lat,pos_lon)))) stop("Não consegui mapear dims (time/lat/lon).")
+  
+  start <- rep(1L, length(dim_names))
+  count <- vapply(vinfo$dim, function(d) d$len, integer(1))
+  start[pos_lat] <- min(lat_idx); count[pos_lat] <- length(lat_idx)
+  start[pos_lon] <- min(lon_idx); count[pos_lon] <- length(lon_idx)
+  
+  mm <- numeric(nt)
+  for (it in seq_len(nt)) {
+    start[pos_time] <- it; count[pos_time] <- 1L
+    slice <- ncdf4::ncvar_get(nc, vname, start=start, count=count)
+    mm[it] <- mean_na(as.numeric(slice))
+  }
+  
+  u_att <- ncdf4::ncatt_get(nc, vname, "units")$value
+  mm_day <- to_mm_per_day(mm, u_att)
+  mm_day <- sanity_fix(mm_day)
+  
+  # força vetores atômicos para evitar colunas-lista
+  tibble::tibble(
+    data  = as.Date(as.vector(datas)),
+    mm_dia = as.numeric(mm_day)
+  )
+}
+
+# --------- EXECUÇÃO -----------------------------------------------
+if (!dir.exists(eta_dir)) stop("Pasta Eta_BESM_20km não encontrada.")
+nc_files <- list.files(eta_dir, pattern="\\.nc$", full.names=TRUE)
+if (!length(nc_files)) stop("Nenhum .nc encontrado em Eta_BESM_20km.")
+log_ok(sprintf("Encontrados %d arquivos NetCDF.", length(nc_files)))
+
+parse_scenario <- function(fname){
+  f <- tolower(basename(fname))
+  if (grepl("histor", f)) return("Histórico")
+  if (grepl("rcp4\\.5|rcp45", f)) return("RCP 4.5")
+  if (grepl("rcp8\\.5|rcp85", f)) return("RCP 8.5")
+  NA_character_
+}
+
+res_list <- vector("list", length(nc_files))
+k <- 0L
+for (f in nc_files) {
+  log_ok(paste("Processando:", basename(f)))
+  df <- tryCatch(
+    extract_eta_daily_one(f, lat_range=lat_range, lon_range=lon_range),
+    error = function(e) { log_err(paste("Erro em", basename(f), "->", e$message)); NULL }
+  )
+  if (is.null(df)) { log_warn(paste("Pulei (erro ao extrair):", basename(f))); next }
+  df$cenario <- parse_scenario(f)
+  df$arquivo <- basename(f)
+  out_one <- file.path(eta_dir, sub("\\.nc$", "_daily_campos.csv", basename(f)))
+  readr::write_csv(df, out_one)
+  log_ok(paste("→ salvo:", out_one))
+  k <- k + 1L; res_list[[k]] <- df
+}
+res_list <- res_list[seq_len(k)]
+
+if (!length(res_list)) stop("Nenhuma série diária criada.")
+todos <- dplyr::bind_rows(res_list) |> dplyr::arrange(data, cenario, arquivo)
+out_all <- file.path(eta_dir, "ETA_BESM_daily_campos.csv")
+readr::write_csv(todos, out_all)
+log_ok(paste("✅ CSV combinado salvo em:", out_all))
+
+# resumo (apenas para checagem; não cria colunas-lista)
+resumo <- todos |>
+  dplyr::group_by(arquivo, cenario) |>
+  dplyr::summarise(n_dias = dplyr::n(),
+                   ini = min(data), fim = max(data),
+                   media_mm_dia = mean(mm_dia, na.rm=TRUE),
+                   anual_equiv = mean(mm_dia, na.rm=TRUE)*365.25,
+                   .groups = "drop")
+print(resumo)
