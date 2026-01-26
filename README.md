@@ -2,8 +2,6 @@
 
 Pipeline completo para **análise pluviométrica** de Campos dos Goytacazes (RJ) com três etapas integradas:
 
-1. **Extração ETA_BESM 20 km** → precipitação **diária** (mm/dia) a partir de arquivos NetCDF.  
-2. **Mapa/Contexto ERA5 + Estação INMET** → base cartográfica e validação espacial.  
 3. **Processamento Pluviométrico Integrado** → unificação (ERA5, Estação, ETA_BESM), QA, estatísticas (MK, Sen, Pettitt), anomalias e gráficos.
 
 > **Janelas de análise**: Histórico **1994–2024** e Cenários **2006–2064** (RCP 4.5/8.5).  
