@@ -1,216 +1,149 @@
-Este script executa um pipeline completo para padronizar, comparar e visualizar séries de precipitação entre:
+Pipeline de Precipitação (1994–2024) — Estação 83698 × ERA5 × ETA-BESM
 
-Estação (83698): dados diários (entrada) → agregação anual e mensal
+Pipeline em R para padronizar, comparar e gerar produtos (tabelas + gráficos) a partir de séries de precipitação de:
 
-ERA5-Land: série anual (obrigatória se existir) e mensal (opcional)
+Estação (83698): dados diários → agregação anual e mensal
 
-ETA-BESM: série anual (Histórico + cenários RCP) e série mensal long (por cenário)
+ERA5-Land: série anual (tp_anual.csv) e mensal (opcional)
 
-O foco do pipeline é o período 1994–2024 (configurável), gerando tabelas padronizadas, métricas de validação, estatísticas, e 23 gráficos (dependendo da disponibilidade de arquivos).
+ETA-BESM: série anual (Hist/RCP4.5/RCP8.5) e mensal long por cenário
 
-1) O que o script gera
+Período padrão: 1994–2024.
 
-Ao final, o script cria uma pasta com timestamp em DIR_OUTROOT, contendo:
+Sumário
 
-Gráficos (.png) na raiz da pasta de saída
+1. Requisitos
 
-Tabelas (.csv / .xlsx) na subpasta: /_tabelas_csv
+2. Configuração rápida
 
-(opcional/previsto) pasta /_qa_preprocessamento para QA (neste trecho do script ela é criada, mas não é preenchida)
+3. Entradas esperadas
 
-Principais produtos
+4. Saídas geradas
 
-Tabelas
+5. Gráficos gerados (checklist)
 
-Tabela 06: ERA5 anual padronizada (1994–2024)
+6. Observações importantes
 
-Tabela 07: Estação anual padronizada (1994–2024)
+7. Problemas comuns (FAQ)
 
-Tabela 09: Estatísticas descritivas anuais (1994–2024)
+1. Requisitos
+R e pacotes
 
-Tabela 10: Relatório de zeros e NA (anual e diário)
-
-Tabela 11: Métricas de comparação pareada (correlação, viés, MAE, RMSE)
-
-Gráficos
-
-Validação (dispersão, QQ, Taylor)
-
-Anomalias (ERA5, Estação, ETA por cenário)
-
-Climatologia mensal + heatmaps
-
-Comparação anual entre fontes (linhas)
-
-Distribuições (boxplot anual, densidade)
-
-Média móvel (5 anos)
-
-Distribuição mensal por década
-
-2) Requisitos
-R (pacotes)
-
-O script carrega (e falha se faltar) os pacotes:
+O script exige:
 
 readr, readxl, dplyr, tidyr, stringr, purrr, lubridate
 
 ggplot2, writexl, tibble
 
-Além disso:
-
 Kendall (obrigatório)
 
 trend (obrigatório)
 
-plotrix (opcional — necessário apenas para o Gráfico 04 (Taylor))
+plotrix (opcional, somente para o Gráfico 04 — Taylor)
 
-Se plotrix não estiver instalado, o script avisa e não gera o gráfico Taylor.
+Instalação (se precisar):
 
-Parâmetros principais
+install.packages(c(
+  "readr","readxl","dplyr","tidyr","stringr","purrr","lubridate",
+  "ggplot2","writexl","tibble","Kendall","trend","plotrix"
+))
 
-No topo do script:
+2. Configuração rápida
+
+No topo do script, ajuste os parâmetros:
 
 YEAR_MIN      <- 1994
 YEAR_MAX_HIST <- 2024
 
-3) Estrutura de pastas (caminhos)
 
-Edite a seção CAMINHOS (AJUSTE AQUI):
+E principalmente a seção de caminhos:
 
-DIR_ESTACAO: pasta da Estação
+DIR_ESTACAO <- "C:/.../01_DADOS ESTAÇÃO"
+DIR_ETA     <- "C:/.../02_ETA_BESM_pluviometria_pronto"
+DIR_ERA5    <- "C:/.../ERA5_LAND_BAIXADO"
+DIR_OUTROOT <- "C:/.../05_RESULTADOS"
 
-DIR_ETA: pasta do ETA
+ESTACAO_FORCADA <- "C:/.../dados_83698_H_1994-01-01_2024-12-31.xlsx"
+ETA_FORCADO     <- "C:/.../ETA_BESM_ANUAL_1994_2064.csv"
+ERA5_FORCADO    <- "C:/.../tp_anual.csv"
 
-DIR_ERA5: pasta do ERA5
+ETA_MENSAL_OU_DIARIO_FORCADO <- "C:/.../ETA_pluv_long.csv"
 
-DIR_OUTROOT: pasta onde será criada a saída com timestamp
+ERA5_MENSAL_FORCADO <- ""  # opcional
 
-O script está configurado para usar “travamentos” (caminhos forçados) com arquivos específicos:
 
-ESTACAO_FORCADA (obrigatório)
+Execute o script inteiro no RStudio.
 
-ETA_FORCADO (anual) (se existir)
+3. Entradas esperadas
+3.1 Estação (diária) — .xlsx/.csv (obrigatório)
 
-ERA5_FORCADO (anual) (se existir)
+Precisa ter:
 
-ETA_MENSAL_OU_DIARIO_FORCADO (obrigatório para heatmaps ETA mensais / gráficos 18–20)
+coluna de data parecida com: data, date, dia, data_medicao
 
-ERA5_MENSAL_FORCADO (opcional; se vazio, o script tenta “descobrir” um mensal perto do anual)
+coluna de precipitação parecida com: precip, chuva, rain, mm
 
-4) Formato esperado dos arquivos de entrada
-4.1 Estação (diária) — Excel/CSV
+O script tenta datas em: ymd, dmy, ymd_hms.
 
-Entrada: ESTACAO_FORCADA
+3.2 ERA5 anual — .csv (opcional, mas recomendado)
 
-O script tenta localizar colunas por padrões (case-insensitive). Precisa de:
+Campos esperados:
 
-Data: uma coluna parecida com data, date, dia, data_medicao
+ano: ano / year / yyyy
 
-Precipitação: uma coluna contendo algo como precip, chuva, rain, mm
+precip: valor / tp / precipitacao / precip / pr / p
 
-A data é interpretada em ordem:
+Unidade: se os valores parecerem estar em metros, o script converte automaticamente para mm (× 1000).
 
-ymd
+3.3 ETA-BESM anual — .csv/.xlsx (opcional)
 
-dmy
+Campos esperados:
 
-ymd_hms
+ano: ano / year / yyyy
 
-Saída interna:
+cenário: cenario / scenario
 
-precipitacao_dia (mm/dia)
+precip: precipitacao / precip / tp / valor / mm
 
-agregação anual: soma por ano → estacao_anual
+Cenários são normalizados para:
 
-4.2 ERA5 anual — CSV
+Historico
 
-Entrada: ERA5_FORCADO (ex.: tp_anual.csv)
+RCP 4.5
 
-Precisa de:
+RCP 8.5
 
-ano: ano, year, yyyy
+3.4 ETA mensal long — .csv (opcional; necessário p/ gráficos 18–20)
 
-precip: valor, tp, precipitacao, precip, rain, pr, p
-
-Atenção unidade: o script detecta valores pequenos (mediana < ~10) como provável metros (tp do ERA5) e converte para mm multiplicando por 1000.
-
-4.3 ETA-BESM anual — CSV/XLSX
-
-Entrada: ETA_FORCADO
-
-Precisa de:
-
-ano: ano, year, yyyy
-
-cenário: cenario, scenario
-
-precip: precipitacao, precip, tp, rain, mm, valor
-
-Normalização de cenário:
-
-“hist” → Historico
-
-variações de 4.5 → RCP 4.5
-
-variações de 8.5 → RCP 8.5
-
-4.4 ETA mensal (long) — CSV
-
-Entrada: ETA_MENSAL_OU_DIARIO_FORCADO (ex.: ETA_pluv_long.csv)
-
-Precisa de:
+Campos esperados:
 
 cenário: cenario/scenario
 
-precip mensal: prec_mm, prec, precipitacao, valor, mm
+precip mensal: prec_mm / prec / precipitacao / valor / mm
 
-E ou:
+e ou:
 
-data/date (o script extrai ano/mês)
+data/date (extrai ano/mês)
 
-ou colunas ano + mes
+ou ano + mes
 
-5) Como executar
+4. Saídas geradas
 
-Ajuste os caminhos na seção CAMINHOS (AJUSTE AQUI).
+O script cria uma pasta com timestamp em DIR_OUTROOT:
 
-Garanta que os pacotes estejam instalados.
+05_RESULTADOS/
+  └── YYYY-MM-DD_HHhMM/
+      ├── _tabelas_csv/
+      ├── _qa_preprocessamento/
+      ├── GRAFICO_01_...
+      ├── GRAFICO_02_...
+      └── ...
 
-Rode o script inteiro no R/RStudio.
+4.1 Tabelas (em _tabelas_csv/)
 
-Ao iniciar, ele cria uma pasta de saída com timestamp:
-
-DIR_OUTROOT/YYYY-MM-DD_HHhMM/
-  |_ _tabelas_csv/
-  |_ _qa_preprocessamento/
-  |_ (gráficos .png)
-
-
-Se PRINT_OUTPUTS <- TRUE, o script imprime no console um checklist com o que foi gerado.
-
-6) Saídas geradas (arquivos)
-6.1 Tabelas (em /_tabelas_csv)
-
-Sempre que houver dados, o script salva:
-
-ESTACAO_ANUAL_1994_2024.csv
+TABELA_06_ERA5_ANUAL_PADRONIZADA_1994_2024.csv (se ERA5 existir)
 
 TABELA_07_ESTACAO_ANUAL_PADRONIZADA_1994_2024.csv
-
-Se ERA5 anual existir:
-
-ERA5_ANUAL_1994_2024.csv
-
-TABELA_06_ERA5_ANUAL_PADRONIZADA_1994_2024.csv
-
-ERA5_ANUAL_padronizado_raw.csv
-
-Se ETA anual existir:
-
-ETA_BESM_HIST_ANUAL_1994_2024.csv (apenas cenário histórico, limitado a 1994–2024)
-
-Estatísticas e métricas:
 
 TABELA_09_ESTATISTICAS_DESCRITIVAS_ANUAL_1994_2024.csv + .xlsx
 
@@ -218,133 +151,120 @@ TABELA_10_ZEROS_ANUAL_DIARIO.csv + .xlsx
 
 TABELA_11_METRICAS_UNIFICADAS.csv + .xlsx
 
-Pareamentos (se aplicável):
+Extras (quando aplicável):
 
-PARES_ERA5_ESTACAO_1994_2024.csv
+ERA5_ANUAL_1994_2024.csv
 
-PARES_ETA_ESTACAO_1994_2024.csv
-
-Mensal:
+ESTACAO_ANUAL_1994_2024.csv
 
 ESTACAO_MENSAL_1994_2024.csv
 
-ERA5_MENSAL_1994_2024.csv (se mensal existir)
+ERA5_MENSAL_1994_2024.csv (se ERA5 mensal existir)
 
-7) Lista de gráficos (nomes e descrição)
+ETA_BESM_HIST_ANUAL_1994_2024.csv (se ETA existir)
 
-Alguns gráficos dependem da existência das séries correspondentes.
+PARES_ERA5_ESTACAO_1994_2024.csv (se houver pareamento)
 
-Validação (ERA5/ETA vs Estação)
+PARES_ETA_ESTACAO_1994_2024.csv (se houver pareamento)
 
-Gráfico 01 — Dispersão anual ERA5 vs Estação
-GRAFICO_01_DISP_ERA5_VS_ESTACAO_1994_2024.png
+5. Gráficos gerados (checklist)
 
-Gráfico 02 — Dispersão anual ETA (Hist) vs Estação
-GRAFICO_02_DISP_ETA_HIST_VS_ESTACAO_1994_2024.png
+A existência depende dos dados disponíveis.
 
-Gráfico 03 — QQ-plot empírico ERA5 vs Estação
-GRAFICO_03_QQ_ERA5_VS_ESTACAO_1994_2024.png
+Validação
 
-Gráfico 04 — Diagrama de Taylor ERA5 vs Estação (requer plotrix)
-GRAFICO_04_TAYLOR_ERA5_VS_ESTACAO_1994_2024.png
+ GRAFICO_01_DISP_ERA5_VS_ESTACAO_1994_2024.png
 
-Climatologia e heatmaps mensais
+ GRAFICO_02_DISP_ETA_HIST_VS_ESTACAO_1994_2024.png
 
-Gráfico 05 — Climatologia mensal ERA5 (requer ERA5 mensal)
-GRAFICO_05_CLIMA_MENSAL_ERA5_1994_2024.png
+ GRAFICO_03_QQ_ERA5_VS_ESTACAO_1994_2024.png
 
-Gráfico 06 — Climatologia mensal Estação
-GRAFICO_06_CLIMA_MENSAL_ESTACAO_1994_2024.png
+ GRAFICO_04_TAYLOR_ERA5_VS_ESTACAO_1994_2024.png (plotrix)
 
-Gráfico 07 — Heatmap mensal ERA5 (requer ERA5 mensal)
-GRAFICO_07_HEATMAP_ERA5_1994_2024.png
+Mensal / Heatmap
 
-Gráfico 08 — Heatmap mensal Estação
-GRAFICO_08_HEATMAP_ESTACAO_1994_2024.png
+ GRAFICO_05_CLIMA_MENSAL_ERA5_1994_2024.png (ERA5 mensal)
 
-Distribuições e comparação entre fontes
+ GRAFICO_06_CLIMA_MENSAL_ESTACAO_1994_2024.png
 
-Gráfico 09 — Densidade anual (ERA5, Estação, ETA base única)
-GRAFICO_09_DENSIDADE_3BASES_1994_2024.png
+ GRAFICO_07_HEATMAP_ERA5_1994_2024.png (ERA5 mensal)
 
-Gráfico 13 — Boxplot anual por fonte
-GRAFICO_13_DISTRIB_ANUAL_FONTES_1994_2024.png
+ GRAFICO_08_HEATMAP_ESTACAO_1994_2024.png
 
-Gráfico 21 — Série anual por fonte (ERA5, Estação, ETA costurado em 2 linhas)
-GRAFICO_21_PRECIP_ANUAL_FONTES_1994_2024.png
+Distribuições / Comparações
+
+ GRAFICO_09_DENSIDADE_3BASES_1994_2024.png
+
+ GRAFICO_13_DISTRIB_ANUAL_FONTES_1994_2024.png
+
+ GRAFICO_21_PRECIP_ANUAL_FONTES_1994_2024.png
 
 Anomalias
 
-Gráfico 10 — Anomalia anual ERA5 (baseline 1994–2024 do próprio ERA5)
-GRAFICO_10_ANOMALIA_ERA5_1994_2024.png
+ GRAFICO_10_ANOMALIA_ERA5_1994_2024.png
 
-Gráfico 11 — Anomalia anual Estação (baseline 1994–2024 da própria Estação)
-GRAFICO_11_ANOMALIA_ESTACAO_1994_2024.png
+ GRAFICO_11_ANOMALIA_ESTACAO_1994_2024.png
 
-Gráfico 12 — Anomalia anual ETA com 2 cenários (baseline = média ETA Hist 1994–2005)
-GRAFICO_12_ANOMALIA_ETA_CENARIOS_1994_2024.png
+ GRAFICO_12_ANOMALIA_ETA_CENARIOS_1994_2024.png
 
-Gráfico 17 — Anomalia ETA por cenário (baseline = média Estação 1994–2024)
-GRAFICO_17_ANOMALIA_POR_CENARIO_BASELINE_ESTACAO_1994_2024.png
+ GRAFICO_17_ANOMALIA_POR_CENARIO_BASELINE_ESTACAO_1994_2024.png
 
-Médias móveis (5 anos)
+Média móvel (5 anos)
 
-Gráfico 14 — MM5 ERA5
-GRAFICO_14_MM5_ERA5_1994_2024.png
+ GRAFICO_14_MM5_ERA5_1994_2024.png
 
-Gráfico 15 — MM5 Estação
-GRAFICO_15_MM5_ESTACAO_1994_2024.png
+ GRAFICO_15_MM5_ESTACAO_1994_2024.png
 
-Gráfico 16 — MM5 ETA costurado (2 linhas: Hist+RCP45 e Hist+RCP85)
-GRAFICO_16_MM5_ETA_CENARIOS_1994_2024.png
+ GRAFICO_16_MM5_ETA_CENARIOS_1994_2024.png
 
-ETA mensal por cenário (heatmaps)
+ETA mensal por cenário
 
-Gráfico 18 — Heatmap ETA Histórico (1994–2024, eixo completo)
-GRAFICO_18_HEATMAP_ETA_HIST_1994_2024.png
+ GRAFICO_18_HEATMAP_ETA_HIST_1994_2024.png
 
-Gráfico 19 — Heatmap ETA RCP 4.5 (janela sem anos vazios 1994–2005; começa ≥ 2006)
-GRAFICO_19_HEATMAP_ETA_RCP45_1994_2024.png
+ GRAFICO_19_HEATMAP_ETA_RCP45_1994_2024.png
 
-Gráfico 20 — Heatmap ETA RCP 8.5 (idem)
-GRAFICO_20_HEATMAP_ETA_RCP85_1994_2024.png
+ GRAFICO_20_HEATMAP_ETA_RCP85_1994_2024.png
 
 Mensal por década
 
-Gráfico 22 — Boxplot mensal por década (ERA5) (requer ERA5 mensal)
-GRAFICO_22_MENSAL_POR_DECADA_ERA5_1994_2024.png
+ GRAFICO_22_MENSAL_POR_DECADA_ERA5_1994_2024.png (ERA5 mensal)
 
-Gráfico 23 — Boxplot mensal por década (Estação)
-GRAFICO_23_MENSAL_POR_DECADA_ESTACAO_1994_2024.png
+ GRAFICO_23_MENSAL_POR_DECADA_ESTACAO_1994_2024.png
 
-8) Observações importantes
+6. Observações importantes
+ERA5: metros vs mm
 
-Recorte temporal: tudo é filtrado para YEAR_MIN…YEAR_MAX_HIST (padrão 1994–2024).
+ERA5 (tp) pode vir em metros. O script verifica a mediana e, se parecer “muito pequeno”, converte para mm.
 
-ERA5 em metros vs mm: há correção automática baseada na mediana dos valores.
+ETA “costurado” (anual)
 
-ETA “costurado”:
+Para comparações anuais (1994–2024), o ETA vira duas linhas:
 
-1994–2005: Historico
+ETA-BESM (Hist+RCP 4.5) = Histórico (1994–2005) + RCP 4.5 (2006–2024)
 
-2006–2024: RCP 4.5 ou RCP 8.5
+ETA-BESM (Hist+RCP 8.5) = Histórico (1994–2005) + RCP 8.5 (2006–2024)
 
-Isso gera duas linhas de ETA (Hist+RCP45 e Hist+RCP85) nos gráficos comparativos.
+ETA base única (densidade)
 
-Densidade (Gráfico 09): ETA vira uma base única:
+No Gráfico 09, ETA é tratado como “uma base”:
 
 1994–2005: Histórico
 
-2006–2024: média entre RCP4.5 e RCP8.5 (ano a ano)
+2006–2024: média anual entre RCP 4.5 e RCP 8.5
 
-9) Solução de problemas (erros comuns)
+7. Problemas comuns (FAQ)
 
-“🚩 Pacotes faltando”: instale o pacote indicado (install.packages("...")).
+1) “🚩 Pacotes faltando …”
+Instale com install.packages(...).
 
-“Não encontrei coluna …”: seu arquivo tem nomes de colunas fora dos padrões esperados.
-Ajuste o cabeçalho do arquivo ou amplie os padrões dentro de .pick_col().
+2) “Não encontrei coluna …”
+O cabeçalho do seu arquivo não bate com os padrões. Renomeie as colunas ou amplie os padrões em .pick_col().
 
-“não consegui interpretar data”: a coluna de data está em um formato não reconhecido.
-Padronize para YYYY-MM-DD (recomendado).
+3) “não consegui interpretar a coluna de data”
+Padronize para YYYY-MM-DD (ex.: 1994-01-01).
 
-Sem ERA5 mensal: gráficos 05, 07 e 22 não serão gerados.
+4) Não gerou Gráfico 04 (Taylor)
+Instale plotrix.
+
+5) Não gerou Gráficos 5/7/22 (ERA5 mensal)
+Você não tem o CSV mensal; defina ERA5_MENSAL_FORCADO ou garanta que exista um arquivo com “mensal/tp_mensal” próximo ao anual para o auto-discovery.
