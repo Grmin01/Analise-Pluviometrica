@@ -1,209 +1,350 @@
-# Analise-Pluviometrica
+Este script executa um pipeline completo para padronizar, comparar e visualizar séries de precipitação entre:
 
-Pipeline completo para **análise pluviométrica** de Campos dos Goytacazes (RJ) com três etapas integradas:
+Estação (83698): dados diários (entrada) → agregação anual e mensal
 
-3. **Processamento Pluviométrico Integrado** → unificação (ERA5, Estação, ETA_BESM), QA, estatísticas (MK, Sen, Pettitt), anomalias e gráficos.
+ERA5-Land: série anual (obrigatória se existir) e mensal (opcional)
 
-> **Janelas de análise**: Histórico **1994–2024** e Cenários **2006–2064** (RCP 4.5/8.5).  
-> **Alvo**: Município de Campos dos Goytacazes (−21.7, −41.3).
+ETA-BESM: série anual (Histórico + cenários RCP) e série mensal long (por cenário)
 
----
+O foco do pipeline é o período 1994–2024 (configurável), gerando tabelas padronizadas, métricas de validação, estatísticas, e 23 gráficos (dependendo da disponibilidade de arquivos).
 
-## ⚙️ Dependências (R)
+1) O que o script gera
 
-- Leitura/arrumação: `readr`, `readxl`, `dplyr`, `tidyr`, `stringr`, `stringi`, `lubridate`, `tibble`, `zoo`
-- NetCDF: `ncdf4`
-- Estatística: `Kendall`, `trend`
-- Gráficos: `ggplot2`, `plotrix` (Taylor), `ggspatial`
-- Dados geográficos: `sf`, `geobr`
-- Exportação: `writexl`
+Ao final, o script cria uma pasta com timestamp em DIR_OUTROOT, contendo:
 
-Instalação rápida (R):
+Gráficos (.png) na raiz da pasta de saída
 
-```r
-pkgs <- c("readr","readxl","dplyr","tidyr","stringr","stringi","lubridate","tibble","zoo",
-          "ncdf4","Kendall","trend","ggplot2","plotrix","sf","geobr","ggspatial","writexl")
-to_install <- setdiff(pkgs, rownames(installed.packages()))
-if (length(to_install)) install.packages(to_install, dependencies = TRUE)
-```
+Tabelas (.csv / .xlsx) na subpasta: /_tabelas_csv
 
----
+(opcional/previsto) pasta /_qa_preprocessamento para QA (neste trecho do script ela é criada, mas não é preenchida)
 
-## 🗂️ Estrutura sugerida de pastas
+Principais produtos
 
-```
-Analise-Pluviometrica/
-├── 1-EXTRACAO_ ETA_BESM_20km.R
-├── 2-Extrair_ERA5.R
-├── 3-Processamento-Pluviometico.R
-├── dados/                    # planilhas e csvs de entrada (ERA5/Estação/ETA_BESM)
-├── Eta_BESM_20km/            # NetCDFs ETA_BESM 20 km
-├── resultados/               # saídas (png/csv/xlsx) com carimbo de data/hora
-└── mapas/                    # mapas gerados (png/pdf)
-```
+Tabelas
 
-> Os scripts criam automaticamente subpastas carimbadas em `resultados/` e `dados/` para cada execução.
+Tabela 06: ERA5 anual padronizada (1994–2024)
 
----
+Tabela 07: Estação anual padronizada (1994–2024)
 
-## 🔄 Fluxo (visão geral)
+Tabela 09: Estatísticas descritivas anuais (1994–2024)
 
-```text
-ETA_BESM (NetCDF) ──► (1) Extração diária (mm/dia) ──► CSVs por arquivo + combinado
-                                           │
-ERA5 + Estação INMET ──► (2) Mapa/Contexto │
-                                           ▼
-                              (3) Processamento Integrado
-                 ► QA e checagens (unidades, zeros, NA, pareamentos)
-                 ► Séries históricas e RCPs coerentes
-                 ► Estatísticas (Mann-Kendall, Sen, Pettitt)
-                 ► Anomalias (baseline 1994–2024)
-                 ► Produtos: heatmaps, boxplots, séries e comparativos
-```
+Tabela 10: Relatório de zeros e NA (anual e diário)
 
----
+Tabela 11: Métricas de comparação pareada (correlação, viés, MAE, RMSE)
 
-## 🚀 Passo a passo
+Gráficos
 
-### 1) Extração ETA_BESM 20 km — `1-EXTRACAO_ ETA_BESM_20km.R`
+Validação (dispersão, QQ, Taylor)
 
-**O que faz**  
-Lê arquivos **NetCDF** (ETA_BESM 20 km), recorta por **bounding box** local, converte a precipitação para **mm/dia**, força vetores atômicos (evita colunas-lista) e exporta **CSV diário por arquivo** + **CSV combinado**.
+Anomalias (ERA5, Estação, ETA por cenário)
 
-**Principais funções**
+Climatologia mensal + heatmaps
 
-- `norm_bbox_to_grid(lon_vec, lon_rng)` → Normaliza o *bbox* ao sistema de longitudes da grade (0–360 vs −180–180).
-- `decode_time(time_vals, time_units)` → Decodifica o eixo de tempo dos NetCDF e devolve `Date` **vetorial** (crítico para evitar matrizes).
-- `find_pr_var(nc)` → Descobre a variável de precipitação entre (`pr`, `precip`, `precipitation`, `tp`) ou por **unidade física**.
-- `to_mm_per_day(values, units_text)` → Converte `kg·m⁻²·s⁻¹` para **mm/dia** e trata `mm/h`, `mm/dia`, etc.
-- `sanity_fix(mm_day_vec)` → Corrige conversões duplicadas (e.g., divide por 86.400 quando mediana diária > 100 mm).
-- `extract_eta_daily_one(nc_path, lat_range, lon_range)` → Extrator robusto: mapeia dims `time/lat/lon`, calcula médias espaciais no *bbox* para cada dia e retorna `data, mm_dia`.
-- `parse_scenario(fname)` → Identifica cenário pelo nome do arquivo (`Histórico`, `RCP 4.5`, `RCP 8.5`).
+Comparação anual entre fontes (linhas)
 
-**Saídas**
+Distribuições (boxplot anual, densidade)
 
-- `*_daily_campos.csv` (um por NetCDF) e `ETA_BESM_daily_campos.csv` (combinado).  
-- **Resumo** por arquivo: número de dias, período, média mm/dia, equivalente anual.
+Média móvel (5 anos)
 
----
+Distribuição mensal por década
 
-### 2) Contexto ERA5/Estação — `2-Extrair_ERA5.R`
+2) Requisitos
+R (pacotes)
 
-**O que faz**  
-Gera o **mapa de localização** da Estação INMET **Campos (A603)**, com **buffer** (~10 km), grade, setas de norte e escala. Serve para **validar espacialmente** as séries usadas.
+O script carrega (e falha se faltar) os pacotes:
 
-**Blocos/funções destacáveis**
+readr, readxl, dplyr, tidyr, stringr, purrr, lubridate
 
-- **Tema de mapa** (`theme_map`) → fundo oceânico, tons neutros para polígonos municipais.  
-- `geobr::read_municipality("RJ")` → Base municipal do RJ (2020).  
-- `sf` → Cria *feature* da estação, reprojeta para UTM 24S (`31984`) e faz **buffer**.  
-- `ggspatial::annotation_north_arrow` e `annotation_scale` → elementos cartográficos.  
-- `ggsave()` → exporta **PNG** e **PDF** (com *fallback* se `cairo_pdf` indisponível).
+ggplot2, writexl, tibble
 
-**Saídas**
+Além disso:
 
-- `mapa_estacao_inmet_campos.png` e `mapa_estacao_inmet_campos.pdf` (pasta atual).
+Kendall (obrigatório)
 
----
+trend (obrigatório)
 
-### 3) Processamento Pluviométrico Integrado — `3-Processamento-Pluviometico.R`
+plotrix (opcional — necessário apenas para o Gráfico 04 (Taylor))
 
-**O que faz**  
-Integra **ERA5**, **Estação INMET (83698)** e **ETA_BESM**; padroniza, corrige **unidades**, delimita **janelas coerentes** (1994–2024 / 2006–2064), calcula **estatísticas de tendência** e **anomalias**, e produz **gráficos** e **relatórios de qualidade**.
+Se plotrix não estiver instalado, o script avisa e não gera o gráfico Taylor.
 
-**Principais utilitários**
+Parâmetros principais
 
-- `._normalize_names(nms)` → Normaliza nomes das colunas (ASCII, minúsculas, *snake_case*).  
-- `._pick_col(df, patterns, required, hint)` → Localiza coluna por **regex** (tolerante a variações).  
-- `._read_csv_smart(path)` → Detecta delimitador `;`/`,` e `decimal_mark` (`,`/`.`).  
-- `._limit_anos(df, col, min, max)` → Recorte temporal coerente por fonte.  
-- `._normalize_cenario(x)` → Padroniza rótulos: `Historico`, `RCP 4.5`, `RCP 8.5`.  
-- `._fix_unidade_anual(df, col, fonte)` → Corrige **unidade suspeita** (e.g., ÷ 1000 quando mediana anual > 10.000).
+No topo do script:
 
-**Leituras e pads**
+YEAR_MIN      <- 1994
+YEAR_MAX_HIST <- 2024
 
-- **ERA5** (`csv`/`xlsx`): detecta `anual` ou reconstrói a partir do **diário**; exporta `ERA5_ANUAL_1994_2024.csv`.  
-- **Estação 83698** (`xlsx`): função `ler_estacao_diaria()` reconstitui diário e anual, com **QA de unidade**.  
-- **ETA_BESM**: usa `ETA_BESM_ANUAL_1994_2064.csv` se existir; caso contrário agrega a partir dos diários `*_daily_campos.csv`.
+3) Estrutura de pastas (caminhos)
 
-**Estatísticas e inferências**
+Edite a seção CAMINHOS (AJUSTE AQUI):
 
-- `._calc_all_stats(x)` → **Mann-Kendall** (τ, p), **Sen’s slope** (mm/ano) e **Pettitt** (ponto de mudança).  
-  - Converte o índice do Pettitt (`cp`) para **ano** de forma segura (`cp_year`).  
-- Saídas unificadas em `estatisticas_unificadas.csv/.xlsx`, incluindo **escopo** (por cenário e por base).
+DIR_ESTACAO: pasta da Estação
 
-**Anomalias (baseline 1994–2024)**
+DIR_ETA: pasta do ETA
 
-- `calc_anom(df, ref)` → anomalia = `precipitacao - média(ref)`.  
-- Gera **anomalias** para ERA5, Estação e ETA_BESM; além de **anomalia por cenário** (Histórico × RCPs).
+DIR_ERA5: pasta do ERA5
 
-**Gráficos gerados** (exemplos de nomes)
+DIR_OUTROOT: pasta onde será criada a saída com timestamp
 
-- `anomalia_precipitacao_cenarios_1994_2024_vs_2006_2064.png`  
-- `anomalia_era5_ref_1994_2024.png`, `anomalia_estacao_ref_1994_2024.png`, `anomalia_eta_besm_ref_1994_2064.png`  
-- `comparativo_tres_fontes_1994_2024.png` (ERA5 × Estação × ETA_BESM)  
-- `boxplot_anual_fontes_hist1994_2024_rcp_ate_2064.png` e `densidade_anual_fontes_hist1994_2024_rcp_ate_2064.png`  
-- `dispersao_ERA5_vs_Estacao.png`, `dispersao_ETA_Historico_vs_Estacao.png`  
-- `taylor_diagram_era5_estacao_hist_1994_2024.png` e `qqplot_era5_vs_estacao_hist_1994_2024.png`  
-- **Mensais** (se diário disponível): `heatmap_mensal_*`, `climatologia_mensal_*`, `boxplots_decadas_*`  
-- **Média móvel (5a)**: `media_movel5_estacao.png`, `media_movel5_era5.png`, `media_movel5_eta_besm_1994_2064.png`
+O script está configurado para usar “travamentos” (caminhos forçados) com arquivos específicos:
 
-**Relatórios de Qualidade (QA)**
+ESTACAO_FORCADA (obrigatório)
 
-- `qualidade_overview_zeros_na.(csv|xlsx)` → contagem de zeros e ausentes por **fonte** e **nível** (anual/diário).  
-- `qualidade_eta_cenario_anual.(csv|xlsx)` → métricas QA por **cenário** (ETA_BESM).  
-- `qa_resumo_unidades_hist1994_2024_rcp2006_2064.csv` → resumo de unidades/ordens de grandeza.
+ETA_FORCADO (anual) (se existir)
 
-**Produtos mensais (se houver diário)**
+ERA5_FORCADO (anual) (se existir)
 
-- `make_month_table(diario_df, min_year, max_year)` → tabela ano×mês (mm/mês).  
-- `plot_heatmap_mensal`, `plot_clima_mensal`, `plot_box_decadas` → visões sazonais/decadais.  
-- `plot_media_movel(df_anual, label, fname, min, max)` → curva anual + média móvel 5a.
+ETA_MENSAL_OU_DIARIO_FORCADO (obrigatório para heatmaps ETA mensais / gráficos 18–20)
 
----
+ERA5_MENSAL_FORCADO (opcional; se vazio, o script tenta “descobrir” um mensal perto do anual)
 
-## 📑 Entradas & Saídas (resumo)
+4) Formato esperado dos arquivos de entrada
+4.1 Estação (diária) — Excel/CSV
 
-**Entradas**  
-- `Eta_BESM_20km/*.nc` (precipitação diária)  
-- Planilhas/CSVs de **ERA5** e **Estação INMET 83698** (anual/diário)  
-- (Opcional) `ETA_BESM_ANUAL_1994_2064.csv`
+Entrada: ESTACAO_FORCADA
 
-**Saídas**  
-- `Eta_BESM_20km/*_daily_campos.csv` + `ETA_BESM_daily_campos.csv`  
-- `resultados/<timestamp>/...png` (figuras) e `dados/<timestamp>/*.csv|.xlsx`  
-- `estatisticas_unificadas.csv/.xlsx`, `comparativos`, `anomalias`, `QA`
+O script tenta localizar colunas por padrões (case-insensitive). Precisa de:
 
----
+Data: uma coluna parecida com data, date, dia, data_medicao
 
-## 🧪 Boas práticas e QA embutido
+Precipitação: uma coluna contendo algo como precip, chuva, rain, mm
 
-- **Unidades**: correção automática (divisão por 1000 ou por 86.400 quando necessário) com logs.  
-- **Coerência temporal**: recortes específicos para **Histórico** e **RCPs**.  
-- **Pareamentos** para comparações (ERA5 × Estação; ETA histórico × Estação).  
-- **Validação** com Taylor e QQ-plot quando houver dados pareados suficientes (≥ 5 anos).
+A data é interpretada em ordem:
 
----
+ymd
 
-## 🧯 Troubleshooting rápido
+dmy
 
-- **“Estação sem coluna de precip detectável”** → o script tenta fallback na 7ª coluna (G); avalie a planilha.  
-- **Mediana anual absurda** (> 10.000 mm) → o código ajusta unidades; confirme fonte.  
-- **ETA_BESM sem anual pronto** → o script agrega a partir do **diário** automático.  
-- **Plotrix indisponível** → o Taylor diagram é pulado (demais produtos geram normalmente).  
-- **Mapas sem `cairo_pdf`** → exporta PDF com *device* padrão.
+ymd_hms
 
----
+Saída interna:
 
-## 📜 Licença
+precipitacao_dia (mm/dia)
 
-Sugerido: **MIT License** (adicione `LICENSE` conforme a sua preferência institucional).
+agregação anual: soma por ano → estacao_anual
 
----
+4.2 ERA5 anual — CSV
 
-## ✨ Créditos
+Entrada: ERA5_FORCADO (ex.: tp_anual.csv)
 
-- INMET / Estação A603 (Campos dos Goytacazes)  
-- Copernicus ERA5 / ECMWF  
-- ETA_BESM 20 km (INPE/CPTEC)  
-- Comunidade R (pacotes citados acima)
+Precisa de:
+
+ano: ano, year, yyyy
+
+precip: valor, tp, precipitacao, precip, rain, pr, p
+
+Atenção unidade: o script detecta valores pequenos (mediana < ~10) como provável metros (tp do ERA5) e converte para mm multiplicando por 1000.
+
+4.3 ETA-BESM anual — CSV/XLSX
+
+Entrada: ETA_FORCADO
+
+Precisa de:
+
+ano: ano, year, yyyy
+
+cenário: cenario, scenario
+
+precip: precipitacao, precip, tp, rain, mm, valor
+
+Normalização de cenário:
+
+“hist” → Historico
+
+variações de 4.5 → RCP 4.5
+
+variações de 8.5 → RCP 8.5
+
+4.4 ETA mensal (long) — CSV
+
+Entrada: ETA_MENSAL_OU_DIARIO_FORCADO (ex.: ETA_pluv_long.csv)
+
+Precisa de:
+
+cenário: cenario/scenario
+
+precip mensal: prec_mm, prec, precipitacao, valor, mm
+
+E ou:
+
+data/date (o script extrai ano/mês)
+
+ou colunas ano + mes
+
+5) Como executar
+
+Ajuste os caminhos na seção CAMINHOS (AJUSTE AQUI).
+
+Garanta que os pacotes estejam instalados.
+
+Rode o script inteiro no R/RStudio.
+
+Ao iniciar, ele cria uma pasta de saída com timestamp:
+
+DIR_OUTROOT/YYYY-MM-DD_HHhMM/
+  |_ _tabelas_csv/
+  |_ _qa_preprocessamento/
+  |_ (gráficos .png)
+
+
+Se PRINT_OUTPUTS <- TRUE, o script imprime no console um checklist com o que foi gerado.
+
+6) Saídas geradas (arquivos)
+6.1 Tabelas (em /_tabelas_csv)
+
+Sempre que houver dados, o script salva:
+
+ESTACAO_ANUAL_1994_2024.csv
+
+TABELA_07_ESTACAO_ANUAL_PADRONIZADA_1994_2024.csv
+
+Se ERA5 anual existir:
+
+ERA5_ANUAL_1994_2024.csv
+
+TABELA_06_ERA5_ANUAL_PADRONIZADA_1994_2024.csv
+
+ERA5_ANUAL_padronizado_raw.csv
+
+Se ETA anual existir:
+
+ETA_BESM_HIST_ANUAL_1994_2024.csv (apenas cenário histórico, limitado a 1994–2024)
+
+Estatísticas e métricas:
+
+TABELA_09_ESTATISTICAS_DESCRITIVAS_ANUAL_1994_2024.csv + .xlsx
+
+TABELA_10_ZEROS_ANUAL_DIARIO.csv + .xlsx
+
+TABELA_11_METRICAS_UNIFICADAS.csv + .xlsx
+
+Pareamentos (se aplicável):
+
+PARES_ERA5_ESTACAO_1994_2024.csv
+
+PARES_ETA_ESTACAO_1994_2024.csv
+
+Mensal:
+
+ESTACAO_MENSAL_1994_2024.csv
+
+ERA5_MENSAL_1994_2024.csv (se mensal existir)
+
+7) Lista de gráficos (nomes e descrição)
+
+Alguns gráficos dependem da existência das séries correspondentes.
+
+Validação (ERA5/ETA vs Estação)
+
+Gráfico 01 — Dispersão anual ERA5 vs Estação
+GRAFICO_01_DISP_ERA5_VS_ESTACAO_1994_2024.png
+
+Gráfico 02 — Dispersão anual ETA (Hist) vs Estação
+GRAFICO_02_DISP_ETA_HIST_VS_ESTACAO_1994_2024.png
+
+Gráfico 03 — QQ-plot empírico ERA5 vs Estação
+GRAFICO_03_QQ_ERA5_VS_ESTACAO_1994_2024.png
+
+Gráfico 04 — Diagrama de Taylor ERA5 vs Estação (requer plotrix)
+GRAFICO_04_TAYLOR_ERA5_VS_ESTACAO_1994_2024.png
+
+Climatologia e heatmaps mensais
+
+Gráfico 05 — Climatologia mensal ERA5 (requer ERA5 mensal)
+GRAFICO_05_CLIMA_MENSAL_ERA5_1994_2024.png
+
+Gráfico 06 — Climatologia mensal Estação
+GRAFICO_06_CLIMA_MENSAL_ESTACAO_1994_2024.png
+
+Gráfico 07 — Heatmap mensal ERA5 (requer ERA5 mensal)
+GRAFICO_07_HEATMAP_ERA5_1994_2024.png
+
+Gráfico 08 — Heatmap mensal Estação
+GRAFICO_08_HEATMAP_ESTACAO_1994_2024.png
+
+Distribuições e comparação entre fontes
+
+Gráfico 09 — Densidade anual (ERA5, Estação, ETA base única)
+GRAFICO_09_DENSIDADE_3BASES_1994_2024.png
+
+Gráfico 13 — Boxplot anual por fonte
+GRAFICO_13_DISTRIB_ANUAL_FONTES_1994_2024.png
+
+Gráfico 21 — Série anual por fonte (ERA5, Estação, ETA costurado em 2 linhas)
+GRAFICO_21_PRECIP_ANUAL_FONTES_1994_2024.png
+
+Anomalias
+
+Gráfico 10 — Anomalia anual ERA5 (baseline 1994–2024 do próprio ERA5)
+GRAFICO_10_ANOMALIA_ERA5_1994_2024.png
+
+Gráfico 11 — Anomalia anual Estação (baseline 1994–2024 da própria Estação)
+GRAFICO_11_ANOMALIA_ESTACAO_1994_2024.png
+
+Gráfico 12 — Anomalia anual ETA com 2 cenários (baseline = média ETA Hist 1994–2005)
+GRAFICO_12_ANOMALIA_ETA_CENARIOS_1994_2024.png
+
+Gráfico 17 — Anomalia ETA por cenário (baseline = média Estação 1994–2024)
+GRAFICO_17_ANOMALIA_POR_CENARIO_BASELINE_ESTACAO_1994_2024.png
+
+Médias móveis (5 anos)
+
+Gráfico 14 — MM5 ERA5
+GRAFICO_14_MM5_ERA5_1994_2024.png
+
+Gráfico 15 — MM5 Estação
+GRAFICO_15_MM5_ESTACAO_1994_2024.png
+
+Gráfico 16 — MM5 ETA costurado (2 linhas: Hist+RCP45 e Hist+RCP85)
+GRAFICO_16_MM5_ETA_CENARIOS_1994_2024.png
+
+ETA mensal por cenário (heatmaps)
+
+Gráfico 18 — Heatmap ETA Histórico (1994–2024, eixo completo)
+GRAFICO_18_HEATMAP_ETA_HIST_1994_2024.png
+
+Gráfico 19 — Heatmap ETA RCP 4.5 (janela sem anos vazios 1994–2005; começa ≥ 2006)
+GRAFICO_19_HEATMAP_ETA_RCP45_1994_2024.png
+
+Gráfico 20 — Heatmap ETA RCP 8.5 (idem)
+GRAFICO_20_HEATMAP_ETA_RCP85_1994_2024.png
+
+Mensal por década
+
+Gráfico 22 — Boxplot mensal por década (ERA5) (requer ERA5 mensal)
+GRAFICO_22_MENSAL_POR_DECADA_ERA5_1994_2024.png
+
+Gráfico 23 — Boxplot mensal por década (Estação)
+GRAFICO_23_MENSAL_POR_DECADA_ESTACAO_1994_2024.png
+
+8) Observações importantes
+
+Recorte temporal: tudo é filtrado para YEAR_MIN…YEAR_MAX_HIST (padrão 1994–2024).
+
+ERA5 em metros vs mm: há correção automática baseada na mediana dos valores.
+
+ETA “costurado”:
+
+1994–2005: Historico
+
+2006–2024: RCP 4.5 ou RCP 8.5
+
+Isso gera duas linhas de ETA (Hist+RCP45 e Hist+RCP85) nos gráficos comparativos.
+
+Densidade (Gráfico 09): ETA vira uma base única:
+
+1994–2005: Histórico
+
+2006–2024: média entre RCP4.5 e RCP8.5 (ano a ano)
+
+9) Solução de problemas (erros comuns)
+
+“🚩 Pacotes faltando”: instale o pacote indicado (install.packages("...")).
+
+“Não encontrei coluna …”: seu arquivo tem nomes de colunas fora dos padrões esperados.
+Ajuste o cabeçalho do arquivo ou amplie os padrões dentro de .pick_col().
+
+“não consegui interpretar data”: a coluna de data está em um formato não reconhecido.
+Padronize para YYYY-MM-DD (recomendado).
+
+Sem ERA5 mensal: gráficos 05, 07 e 22 não serão gerados.
